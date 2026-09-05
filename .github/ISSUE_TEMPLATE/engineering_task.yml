@@ -1,0 +1,86 @@
+name: Engineering task
+description: Plan a focused engineering change with explicit ownership, dependencies and audit evidence.
+title: "engineering: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use English for engineering artefacts. Keep one implementation owner per issue. Do not include credentials, tokens, personal data, private infrastructure identifiers or raw provider payloads.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: State the verified current condition and why this issue exists. Distinguish evidence from assumptions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: Describe the single result this issue owns.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: List the smallest coherent in-scope implementation or investigation work.
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and coordination
+      description: List hard blockers, sequencing constraints, neighbouring owners and responsibilities this issue must not duplicate.
+      placeholder: |
+        Hard dependency: #123
+        May run in parallel with: #456
+        Ownership boundary: #789 owns alert delivery; this issue only emits the signal.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Use observable, testable conditions that prove the outcome is complete.
+      placeholder: |
+        - [ ] Condition one
+        - [ ] Condition two
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence required
+      description: Define the tests, CI, production-safe checks, redacted operational proof or owner decision required before closure.
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: Explicitly exclude adjacent work that would make the issue harder to review or overlap another owner.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: discipline
+    attributes:
+      label: Engineering discipline
+      options:
+        - label: This issue has one primary implementation owner.
+          required: true
+        - label: Dependencies and overlapping ownership are explicit.
+          required: true
+        - label: Closure requires evidence, not only a plausible configuration or code review.
+          required: true
+        - label: The issue contains no secrets or personal data.
+          required: true
