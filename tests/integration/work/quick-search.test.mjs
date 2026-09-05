@@ -5,10 +5,12 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { readFeatureSource } from "../../helpers/feature-sources.mjs";
+
 import { SPANISH_PROVINCES } from "../../../src/lib/deeplinks/spanish-provinces.ts";
 
 test("QuickJobSearchCard no longer hardcodes an example search - the fields start genuinely empty, with a plain descriptive placeholder, not a fabricated example value (issue #123, owner-reported follow-up)", async () => {
-  const source = await readFile(new URL("../../../src/features/work/client/work-feature.tsx", import.meta.url), "utf8");
+  const source = await readFeatureSource("work");
   const cardStart = source.indexOf("const QuickJobSearchCard = memo(");
   const cardEnd = source.indexOf("\n});", cardStart);
   const cardSource = source.slice(cardStart, cardEnd);
@@ -21,7 +23,7 @@ test("QuickJobSearchCard no longer hardcodes an example search - the fields star
 });
 
 test("The quick-search card wires a real province combobox with type-ahead filtering and a dedicated remote switch (issue #123)", async () => {
-  const source = await readFile(new URL("../../../src/features/work/client/work-feature.tsx", import.meta.url), "utf8");
+  const source = await readFeatureSource("work");
 
   assert.match(source, /import \{ SPANISH_PROVINCES \} from "@\/lib\/deeplinks\/spanish-provinces";/);
   assert.match(source, /function ProvinceCombobox\(/);
@@ -36,7 +38,7 @@ test("The quick-search card wires a real province combobox with type-ahead filte
 });
 
 test("ProvinceCombobox shows its placeholder while disabled instead of a stale leftover province - verified live: toggling teletrabajo on while Granada was selected still displayed 'Granada' until this was fixed (issue #123)", async () => {
-  const source = await readFile(new URL("../../../src/features/work/client/work-feature.tsx", import.meta.url), "utf8");
+  const source = await readFeatureSource("work");
   const comboStart = source.indexOf("function ProvinceCombobox(");
   const comboEnd = source.indexOf("\nconst QuickJobSearchCard", comboStart);
   const comboSource = source.slice(comboStart, comboEnd);
@@ -45,7 +47,7 @@ test("ProvinceCombobox shows its placeholder while disabled instead of a stale l
 });
 
 test("Searching persists the platform's last query/location, and loading pre-fills it from the same source on the next visit (issue #123)", async () => {
-  const source = await readFile(new URL("../../../src/features/work/client/work-feature.tsx", import.meta.url), "utf8");
+  const source = await readFeatureSource("work");
 
   assert.match(source, /import \{ getQuickSearchesAction, saveQuickSearchAction, type SavedQuickSearch \} from "@\/features\/work\/server\/actions";/);
   assert.match(source, /getQuickSearchesAction\(\)\.then\(/, "Work() loads saved searches once, not per-card");
@@ -59,7 +61,7 @@ test("Searching persists the platform's last query/location, and loading pre-fil
 });
 
 test("The empty-keyword state cannot fire a search or a save - the Buscar action is genuinely disabled, not just visually dimmed (issue #123)", async () => {
-  const source = await readFile(new URL("../../../src/features/work/client/work-feature.tsx", import.meta.url), "utf8");
+  const source = await readFeatureSource("work");
   const cardStart = source.indexOf("const QuickJobSearchCard = memo(");
   const cardEnd = source.indexOf("\n});", cardStart);
   const cardSource = source.slice(cardStart, cardEnd);

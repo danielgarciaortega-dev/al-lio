@@ -2,9 +2,16 @@ import { readFile } from "node:fs/promises";
 
 const featureFiles = {
   work: [
-    // work-feature.tsx first so the `function Work(` / `workBrandCss` /
-    // `WORK_DIACRITICS_PATTERN` slice anchors resolve inside it.
+    // work-feature.tsx first so the `function Work(` slice anchor resolves in
+    // it; work-styles.ts (holding `workBrandCss`) then work-portal-search.tsx
+    // (holding `WORK_DIACRITICS_PATTERN`, `function ProvinceCombobox(` and
+    // `const QuickJobSearchCard = memo(`) come next and adjacent, so the
+    // `const workBrandCss` -> `const WORK_DIACRITICS_PATTERN` slice in
+    // catalogue-boundaries.test.mjs spans only the CSS string plus the
+    // portal-search imports - never the leaf card files.
     "work/client/work-feature.tsx",
+    "work/client/work-styles.ts",
+    "work/client/work-portal-search.tsx",
     "work/client/work-portal-cards.tsx",
     "work/client/work-candidatura-card.tsx",
     "work/client/work-company-card.tsx",
