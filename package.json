@@ -114,7 +114,7 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
-    "@eslint/eslintrc": "^3.3.5",
+    "@eslint/eslintrc": "^3.3.7",
     "@next/env": "15.5.23",
     "@playwright/test": "1.62.1",
     "@types/node": "^22.14.0",
