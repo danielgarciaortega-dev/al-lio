@@ -1,31 +1,77 @@
 name: Feature request
-description: Propose a focused student or engineering improvement.
+description: Propose a focused student or product capability without bypassing engineering ownership and evidence rules.
 title: "feature: "
 labels: [enhancement]
 body:
+  - type: markdown
+    attributes:
+      value: Use English for the engineering request. Student-facing copy may remain Spanish. Do not include credentials, personal data or private provider details.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What verified product/user condition motivates this request?
+    validations:
+      required: true
+
   - type: textarea
     id: outcome
     attributes:
-      label: Student or operational outcome
-      description: What becomes safer, clearer or more useful?
+      label: Outcome
+      description: What single student or operational result should become possible?
     validations:
       required: true
+
   - type: textarea
     id: scope
     attributes:
-      label: Proposed scope
-      description: Describe the smallest coherent change.
+      label: Scope
+      description: Describe the smallest coherent capability or behaviour change.
     validations:
       required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and coordination
+      description: List known blockers, adjacent feature owners, migrations, providers or rollout constraints. Write "None known" when appropriate.
+    validations:
+      required: true
+
   - type: textarea
     id: acceptance
     attributes:
       label: Acceptance criteria
-      description: List observable conditions that prove completion.
+      description: List observable conditions that prove the requested outcome is complete.
+      placeholder: |
+        - [ ] Condition one
+        - [ ] Condition two
     validations:
       required: true
+
   - type: textarea
-    id: risks
+    id: evidence
     attributes:
-      label: Security, data and operational risks
-      description: Consider user isolation, migrations, external sources and rollback.
+      label: Evidence required
+      description: What tests, review, production-safe checks or owner decisions should exist before closure?
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What adjacent work must not be pulled into this request?
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: discipline
+    attributes:
+      label: Request discipline
+      options:
+        - label: The request describes one primary outcome rather than a bundle of unrelated changes.
+          required: true
+        - label: I have not included secrets or personal data.
+          required: true
