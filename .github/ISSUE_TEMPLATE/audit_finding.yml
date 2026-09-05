@@ -1,0 +1,105 @@
+name: Audit finding
+description: Record an evidence-backed security, operations, privacy, accessibility or governance finding.
+title: "audit: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Record only evidence that is safe for the repository. Do not publish credentials, tokens, personal data, backup artefacts, raw provider payloads or unnecessary private infrastructure identifiers. Security vulnerabilities that should remain confidential belong in the private security-reporting path.
+
+  - type: input
+    id: baseline
+    attributes:
+      label: Audit baseline
+      description: Date and immutable commit/release SHA when available.
+      placeholder: "2026-09-05 — <40-char SHA>"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - Critical
+        - High
+        - Medium
+        - Low
+        - Informational / evidence gap
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: State the verified current condition and the exact evidence gap or demonstrated defect. Avoid speculative vulnerability claims.
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: Describe the single control or proof this finding must establish.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Define the focused remediation or verification work.
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and coordination
+      description: List blockers and neighbouring issue owners. Separate signal generation, remediation, monitoring and audit coordination where applicable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Define observable conditions that prove the control is implemented and verified.
+      placeholder: |
+        - [ ] Implemented condition
+        - [ ] Verification condition
+        - [ ] Production-observed condition, when applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence required
+      description: Specify CI/tests, matrices, redacted configuration evidence, production-safe checks, rehearsals or residual-risk decisions required before closure.
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: State adjacent controls that belong to other issues or are intentionally excluded.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: audit_discipline
+    attributes:
+      label: Audit discipline
+      options:
+        - label: The finding distinguishes demonstrated facts from unverified assumptions.
+          required: true
+        - label: The issue does not claim exploitation or compliance without evidence.
+          required: true
+        - label: Closure will distinguish implemented, verified and production-observed states where relevant.
+          required: true
+        - label: The issue contains no secrets or personal data.
+          required: true
