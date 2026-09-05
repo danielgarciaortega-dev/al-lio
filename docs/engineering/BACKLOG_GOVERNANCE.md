@@ -1,8 +1,10 @@
 # Engineering backlog governance
 
-This document defines how AL-LÍO engineering work is classified, sequenced, reviewed and closed. The goal is to keep the repository auditable as the product grows without turning coordinators into implementation tickets or mixing unrelated risk domains.
+This document defines how AL-LÍO engineering work is classified, sequenced, reviewed and closed. The goal is to keep the repository auditable and maintainable without adding process that does not fit the project.
 
-The current repository-native execution board is issue #434. The current production-readiness audit coordinator is issue #433.
+AL-LÍO is a **solo-maintained open-source MIT project created through the Aircury Summer of Code 2026 scholarship programme**. Its engineering process should therefore be professional, reproducible and reviewable, but it is not intended to imitate a multi-team company. Team-only controls such as mandatory CODEOWNERS groups, organisation-level approvals, enterprise release trains or staging environments are not requirements unless the project later gains multiple active maintainers or a concrete risk justifies them.
+
+The repository-native execution board is issue #434. The production-readiness audit coordinator is issue #433.
 
 ## 1. Language
 
@@ -19,6 +21,8 @@ When responsibilities touch, document the boundary explicitly. Examples:
 - a security control issue may emit a degradation signal while the monitoring issue owns alert delivery and escalation;
 - a feature-refactor issue may preserve an authorization contract while the authorization audit issue owns the cross-application proof;
 - a rollout coordinator may sequence canaries while each canary has its own focused implementation issue.
+
+For a solo-maintained repository, "owner" means the issue or subsystem that owns the responsibility, not a separate person or team.
 
 If ownership cannot be explained in one or two sentences, split or rewrite the issues before implementation.
 
@@ -73,14 +77,13 @@ Do not use vague phrases such as "depends on security". Name the exact issue/con
 
 ## 7. Work-in-progress limits
 
-For one primary engineer, the default WIP limit is:
+For one primary maintainer, the default is intentionally simple:
 
-- one P0 code/security implementation;
-- one operations/infrastructure task that does not touch the same files/control plane;
-- one external/provider action;
-- one review-only/coordinator activity.
+- one primary code/security implementation;
+- optionally one independent operations/provider task;
+- review/coordinator work as needed.
 
-Avoid concurrent broad refactors that share authentication, Profile, Work, migrations or production configuration.
+Avoid concurrent broad refactors that share authentication, Profile, Work, migrations or production configuration. Keep remote branches tied to active work and delete merged/abandoned branches rather than using branch count as a work queue.
 
 The objective is attributable evidence and small reviewable diffs, not maximum branch count.
 
@@ -94,11 +97,11 @@ Possible evidence includes:
 - green CI at an immutable commit SHA;
 - authorization/data-flow matrices;
 - production-safe status/header/crawl checks;
-- redacted owner/admin configuration evidence;
+- redacted repository/environment settings evidence;
 - synthetic alert tests;
 - isolated backup/restore rehearsals;
 - provider approval/status evidence;
-- explicit residual-risk/owner decisions.
+- explicit residual-risk decisions.
 
 For audit findings, distinguish:
 
@@ -133,7 +136,7 @@ A coordinator may:
 - define sequence;
 - track child status;
 - define cross-cutting evidence standards;
-- record final owner decisions.
+- record final decisions.
 
 A coordinator must not:
 
@@ -154,7 +157,7 @@ A production canary or data mutation should name the exact gates it requires. Ty
 - source/provider approval for externally sourced content;
 - rollback/disable procedure.
 
-The gate should be proportional to risk. Do not invent a dependency merely to make the board look rigorous.
+The gate should be proportional to risk. Do not introduce enterprise-style infrastructure merely for appearance. A single-VPS deployment is acceptable when its release, backup, rollback and observability boundaries are explicit and tested.
 
 ## 12. Pull request discipline
 
@@ -165,12 +168,24 @@ Implementation pull requests should:
 - state relevant tests/evidence;
 - preserve unrelated work;
 - avoid opportunistic cleanup outside scope;
-- not self-merge solely because the author created the issue;
-- use the repository's required CI/review/deployment controls.
+- use the repository's required CI and deployment controls;
+- be reviewed by the maintainer against the diff and acceptance criteria before merge.
+
+Independent review is encouraged when another knowledgeable contributor is available, especially for security-sensitive or destructive changes, but it is **not a standing requirement** for this solo-maintained scholarship project. Self-merge is acceptable after the required checks are green and the maintainer has performed the documented review.
 
 Major dependency migrations, architecture refactors and production rollouts should remain isolated from one another unless a specific technical requirement proves they must move together.
 
-## 13. Audit cycle
+## 13. Repository presentation and history
+
+The public repository should explain the project without exposing local assistant/tooling state.
+
+- Keep AI-assistant configuration and private working files ignored unless they are genuinely part of the product.
+- Historical commit messages and merged branch names are part of project provenance; do not rewrite `main` merely to remove old tool/branch names.
+- Delete merged or abandoned remote branches after confirming no active pull request or unique work depends on them.
+- Keep repository description, homepage, topics, README links, release references and the live production URL consistent.
+- Preserve the Aircury acknowledgement and MIT licence as part of the public project record.
+
+## 14. Audit cycle
 
 Before the next production-readiness audit:
 
@@ -178,8 +193,10 @@ Before the next production-readiness audit:
 2. review #433 and every audit child for evidence status;
 3. confirm P0 findings are closed, mitigated or explicitly accepted;
 4. run a language/structure check over open engineering issues;
-5. record the exact audit baseline SHA/date;
-6. distinguish repository evidence from live-production evidence;
-7. create focused follow-ups for any new finding rather than enlarging old unrelated issues.
+5. review active remote branches and remove stale merged/abandoned heads;
+6. confirm public repository metadata and README URLs match production;
+7. record the exact audit baseline SHA/date;
+8. distinguish repository evidence from live-production evidence;
+9. create focused follow-ups for any new finding rather than enlarging old unrelated issues.
 
 This document should change only when the engineering operating model itself changes, not for routine issue status updates.
