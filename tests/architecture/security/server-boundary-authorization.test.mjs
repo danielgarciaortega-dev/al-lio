@@ -1,0 +1,41 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+import { validateServerBoundaryInventory } from "../../../scripts/check-server-boundary-authorization.mjs";
+
+test("every Route Handler and Server Action file is explicitly classified and satisfies its authorization evidence", () => {
+  assert.deepEqual(validateServerBoundaryInventory(), []);
+});
+
+test("validated sessions fail closed when the database security stamp no longer matches", async () => {
+  const source = await readFile(new URL("../../../src/lib/auth/session.ts", import.meta.url), "utf8");
+  assert.match(source, /export async function getValidatedSession\(\)/);
+  assert.match(source, /await requireValidSessionUser\(session\);/);
+  assert.match(source, /const user = await getUserById\(session\.uid\);/);
+  assert.match(source, /user\.security_stamp !== session\.sv/);
+});
+
+test("administrator authority is re-read from the database rather than trusted from a client or token role", async () => {
+  const source = await readFile(new URL("../../../src/lib/auth/authorization.ts", import.meta.url), "utf8");
+  assert.match(source, /const session = await getValidatedSession\(\);/);
+  assert.match(source, /const user = await getUserById\(session\.uid\);/);
+  assert.match(source, /user\.role !== "admin"/);
+  assert.doesNotMatch(source, /session\.role|searchParams.*role|formData.*role/);
+});
+
+test("Job Radar object mutations remain scoped to both resource id and the validated user id", async () => {
+  const source = await readFile(new URL("../../../src/lib/job-radar/store.ts", import.meta.url), "utf8");
+  assert.match(source, /WHERE id = \$3 AND user_id = \$4/);
+  assert.match(source, /WHERE id = \$2 AND user_id = \$3/);
+  assert.match(source, /WHERE id = \$1 AND user_id = \$2/);
+  assert.match(source, /DELETE FROM public\.job_applications WHERE id = \$1 AND user_id = \$2/);
+});
+
+test("Radar machine ingestion remains authenticated by the signed webhook boundary", async () => {
+  const source = await readFile(new URL("../../../src/lib/radar/webhook-auth.ts", import.meta.url), "utf8");
+  assert.match(source, /AL_LIO_RADAR_WEBHOOK_SECRET/);
+  assert.match(source, /timestamp outside allowed window/);
+  assert.match(source, /createRadarSignature\(secret, timestamp, deliveryId, rawBody\)/);
+  assert.match(source, /radarSignaturesMatch\(expected, signature\)/);
+});
