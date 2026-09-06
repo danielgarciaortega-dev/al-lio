@@ -26,6 +26,9 @@ const baseCompose = `services:
 
 const existingApproval = "al_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG|false";
 const secondApproval = "al_lio_web|AL_LIO_SECOND_FLAG|AL_LIO_SECOND_FLAG|false";
+const existingApprovalAudit = "al_lio_web:AL_LIO_EXISTING_FLAG:AL_LIO_EXISTING_FLAG";
+const secondApprovalAudit = "al_lio_web:AL_LIO_SECOND_FLAG:AL_LIO_SECOND_FLAG";
+const secretSentinel = "SUPER_SECRET_SENTINEL_9f0e7d";
 const composeWithTwoApprovedMappings = baseCompose.replace(
   "      AL_LIO_EXISTING_FLAG: ${AL_LIO_EXISTING_FLAG:-false}",
   "      AL_LIO_EXISTING_FLAG: ${AL_LIO_EXISTING_FLAG:-false}\n      AL_LIO_SECOND_FLAG: ${AL_LIO_SECOND_FLAG:-false}",
@@ -111,7 +114,15 @@ async function expectAccepted(candidateCompose, options = {}) {
 async function expectRejected(candidateCompose, options = {}) {
   const fixture = await createFixture(options.currentCompose ?? baseCompose, candidateCompose);
   try {
-    await assert.rejects(runGuard(fixture, options.currentApprovals, options.candidateApprovals));
+    let rejection;
+    await assert.rejects(
+      runGuard(fixture, options.currentApprovals, options.candidateApprovals),
+      (error) => {
+        rejection = error;
+        return true;
+      },
+    );
+    return rejection;
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -139,12 +150,14 @@ test("accepts one exact removal approved by the current release and consumed by 
 
 test("accepts revoking a staged current approval without removing its mapping", async () => {
   const { stdout } = await expectAccepted(baseCompose, { currentApprovals: existingApproval });
-  assert.match(stdout, new RegExp(`REVOKED:${existingApproval}`));
+  assert.match(stdout, new RegExp(`REVOKED:${existingApprovalAudit}`));
+  assert.doesNotMatch(stdout, /false/);
 });
 
 test("accepts staging one exact approval for the immediately following transition", async () => {
   const { stdout } = await expectAccepted(baseCompose, { candidateApprovals: existingApproval });
-  assert.match(stdout, new RegExp(`STAGED:${existingApproval}`));
+  assert.match(stdout, new RegExp(`STAGED:${existingApprovalAudit}`));
+  assert.doesNotMatch(stdout, /false/);
 });
 
 test("rejects a staged approval that survives into the next release", async () => {
@@ -187,9 +200,95 @@ test("accepts consuming A and revoking B together with an empty candidate approv
     currentCompose: composeWithTwoApprovedMappings,
     currentApprovals: `${existingApproval}\n${secondApproval}`,
   });
-  assert.match(stdout, new RegExp(`CONSUMED:${existingApproval}`));
-  assert.match(stdout, new RegExp(`REVOKED:${secondApproval}`));
+  assert.match(stdout, new RegExp(`CONSUMED:${existingApprovalAudit}`));
+  assert.match(stdout, new RegExp(`REVOKED:${secondApprovalAudit}`));
+  assert.doesNotMatch(stdout, /false/);
 });
+
+test("accepts LF comments, blank lines and an ordinary approval", async () => {
+  const approvals = `# reviewed approval\n\n${existingApproval}\n`;
+  const { stdout } = await expectAccepted(baseCompose, { candidateApprovals: approvals });
+  assert.match(stdout, new RegExp(`STAGED:${existingApprovalAudit}`));
+});
+
+test("accepts an empty exact default for the contractual ${VAR:-} mapping", async () => {
+  const emptyDefaultCompose = baseCompose.replace(
+    "      AL_LIO_EXISTING_FLAG: ${AL_LIO_EXISTING_FLAG:-false}",
+    "      AL_LIO_EXISTING_FLAG: ${AL_LIO_EXISTING_FLAG:-}",
+  );
+  const approval = "al_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG|";
+  const { stdout } = await expectAccepted(emptyDefaultCompose, {
+    currentCompose: emptyDefaultCompose,
+    candidateApprovals: approval,
+  });
+  assert.match(stdout, new RegExp(`STAGED:${existingApprovalAudit}`));
+});
+
+for (const [name, approval] of [
+  ["three fields", "al_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG"],
+  ["five fields", "al_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG|false|extra"],
+  ["an extra pipe", "al_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG|fal|se"],
+  ["an empty service", "|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG|false"],
+  ["an empty destination", "al_lio_web||AL_LIO_EXISTING_FLAG|false"],
+  ["an empty source", "al_lio_web|AL_LIO_EXISTING_FLAG||false"],
+  ["leading service whitespace", " al_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG|false"],
+  ["trailing service whitespace", "al_lio_web |AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG|false"],
+  ["destination whitespace", "al_lio_web| AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG|false"],
+  ["source whitespace", "al_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG |false"],
+  ["a tab", "al_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG\t|false"],
+  ["a wildcard", "al_lio_web|AL_LIO_*|AL_LIO_EXISTING_FLAG|false"],
+  ["a malformed service identifier", "al-lio-web|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG|false"],
+  ["a malformed destination identifier", "al_lio_web|al_lio_existing_flag|AL_LIO_EXISTING_FLAG|false"],
+  ["a malformed source identifier", "al_lio_web|AL_LIO_EXISTING_FLAG|AL-LIO-EXISTING-FLAG|false"],
+]) {
+  test(`rejects approval grammar containing ${name}`, async () => {
+    await expectRejected(baseCompose, { candidateApprovals: approval });
+  });
+}
+
+test("rejects an exact duplicate approval", async () => {
+  await expectRejected(baseCompose, {
+    candidateApprovals: `${existingApproval}\n${existingApproval}`,
+  });
+});
+
+test("rejects a semantic duplicate approval with a different source", async () => {
+  await expectRejected(baseCompose, {
+    candidateApprovals: `${existingApproval}\nal_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_OTHER_SOURCE|false`,
+  });
+});
+
+for (const [name, approvals, expectedIdentity] of [
+  [
+    "an extra field",
+    `al_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_EXISTING_FLAG|${secretSentinel}|extra`,
+    null,
+  ],
+  [
+    "an invalid identifier",
+    `al_lio_web|INVALID-${secretSentinel}|AL_LIO_EXISTING_FLAG|${secretSentinel}`,
+    null,
+  ],
+  [
+    "a semantic duplicate",
+    `${existingApproval.replace("false", secretSentinel)}\nal_lio_web|AL_LIO_EXISTING_FLAG|AL_LIO_OTHER_SOURCE|${secretSentinel}`,
+    /service=al_lio_web destination=AL_LIO_EXISTING_FLAG/,
+  ],
+]) {
+  test(`malformed ${name} rejects without echoing its sentinel record`, async () => {
+    const sentinelCompose = baseCompose.replace(
+      "      AL_LIO_EXISTING_FLAG: ${AL_LIO_EXISTING_FLAG:-false}",
+      `      AL_LIO_EXISTING_FLAG: \${AL_LIO_EXISTING_FLAG:-${secretSentinel}}`,
+    );
+    const error = await expectRejected(sentinelCompose, {
+      currentCompose: sentinelCompose,
+      candidateApprovals: approvals,
+    });
+    assert.doesNotMatch(error.stdout ?? "", new RegExp(secretSentinel));
+    assert.doesNotMatch(error.stderr ?? "", new RegExp(secretSentinel));
+    if (expectedIdentity) assert.match(error.stderr ?? "", expectedIdentity);
+  });
+}
 
 test("rejects consuming A while introducing candidate approval B", async () => {
   const candidate = composeWithTwoApprovedMappings.replace(

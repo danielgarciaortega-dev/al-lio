@@ -100,6 +100,14 @@ approval_record_line() {
   printf '      %s: ${%s:-%s}' "$key" "$source_key" "$default_value"
 }
 
+approval_audit_id() {
+  local service="$1"
+  local key="$2"
+  local source_key="$3"
+
+  printf '%s:%s:%s' "$service" "$key" "$source_key"
+}
+
 validate_removal_approval_data() {
   local approval_data="$1"
   local web_environment="$2"
@@ -115,37 +123,39 @@ validate_removal_approval_data() {
   local service_environment=""
   local match_count=0
   local approval_id=""
+  local line_number=0
   declare -A seen_approvals=()
 
   while IFS= read -r record || [[ -n "$record" ]]; do
+    line_number=$((line_number + 1))
     [[ -z "$record" || "$record" == \#* ]] && continue
 
     separators="${record//[!|]/}"
     [[ "${#separators}" -eq 3 ]] ||
-      compose_env_guard_reject "$label removal approval must contain exactly four pipe-delimited fields: $record" || return 1
+      compose_env_guard_reject "$label removal approval line $line_number must contain exactly four pipe-delimited fields." || return 1
 
     IFS='|' read -r service key source_key default_value <<< "$record"
     case "$service" in
       al_lio_web) service_environment="$web_environment" ;;
       al_lio_radar) service_environment="$radar_environment" ;;
-      *) compose_env_guard_reject "$label removal approval names an unsupported service: $service" || return 1 ;;
+      *) compose_env_guard_reject "$label removal approval line $line_number has an invalid service identifier." || return 1 ;;
     esac
     [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] ||
-      compose_env_guard_reject "$label removal approval has an invalid destination key: $record" || return 1
+      compose_env_guard_reject "$label removal approval line $line_number has an invalid destination identifier." || return 1
     [[ "$source_key" =~ ^[A-Z][A-Z0-9_]*$ ]] ||
-      compose_env_guard_reject "$label removal approval has an invalid source key: $record" || return 1
+      compose_env_guard_reject "$label removal approval line $line_number has an invalid source identifier." || return 1
     [[ "$default_value" =~ ^[-A-Za-z0-9_.,:/+]*$ ]] ||
-      compose_env_guard_reject "$label removal approval has an unsupported default: $record" || return 1
+      compose_env_guard_reject "$label removal approval line $line_number has an unsupported fourth field." || return 1
 
     approval_id="$service:$key"
     [[ -z "${seen_approvals[$approval_id]:-}" ]] ||
-      compose_env_guard_reject "$label removal approval is duplicated: $approval_id" || return 1
+      compose_env_guard_reject "$label removal approval is duplicated for service=$service destination=$key." || return 1
     seen_approvals["$approval_id"]=1
 
     expected_line="$(approval_record_line "$key" "$source_key" "$default_value")"
     match_count="$(grep -Fxc -- "$expected_line" <<< "$service_environment" || true)"
     [[ "$match_count" -eq 1 ]] ||
-      compose_env_guard_reject "$label removal approval does not match exactly one current mapping: $approval_id" || return 1
+      compose_env_guard_reject "$label removal approval does not match exactly one mapping for service=$service destination=$key source=$source_key." || return 1
   done <<< "$approval_data"
 }
 
@@ -201,7 +211,7 @@ classify_approval_transition() {
   done <<< "$candidate_approval_data"
 
   if [[ "${#current_records[@]}" -gt 0 && "${#candidate_records[@]}" -gt 0 ]]; then
-    compose_env_guard_reject "Current release has staged removal approvals, so candidate must contain no active approval; found: ${candidate_records[0]}" || return 1
+    compose_env_guard_reject "Current release has staged removal approvals, so candidate must contain no active approval." || return 1
   fi
 
   if [[ "${#current_records[@]}" -eq 0 ]]; then
@@ -219,10 +229,10 @@ classify_approval_transition() {
       esac
       expected_line="$(approval_record_line "$key" "$source_key" "$default_value")"
       [[ "$(grep -Fxc -- "$expected_line" <<< "$current_environment" || true)" -eq 1 ]] ||
-        compose_env_guard_reject "Candidate tried to stage an approval for a mapping not present unchanged in current Compose: $record" || return 1
+        compose_env_guard_reject "Candidate tried to stage an approval for a mapping not present unchanged in current Compose: service=$service destination=$key source=$source_key." || return 1
       [[ "$(grep -Fxc -- "$expected_line" <<< "$candidate_environment" || true)" -eq 1 ]] ||
-        compose_env_guard_reject "Candidate tried to stage an approval for a mapping not present unchanged in candidate Compose: $record" || return 1
-      staged_compose_env_removal_approvals+=("$record")
+        compose_env_guard_reject "Candidate tried to stage an approval for a mapping not present unchanged in candidate Compose: service=$service destination=$key source=$source_key." || return 1
+      staged_compose_env_removal_approvals+=("$(approval_audit_id "$service" "$key" "$source_key")")
     done
     return 0
   fi
@@ -236,11 +246,11 @@ classify_approval_transition() {
     expected_line="$(approval_record_line "$key" "$source_key" "$default_value")"
     candidate_line="$(environment_line_for_key "$candidate_environment" "$key")"
     if [[ "$candidate_line" == "$expected_line" ]]; then
-      revoked_compose_env_removal_approvals+=("$record")
+      revoked_compose_env_removal_approvals+=("$(approval_audit_id "$service" "$key" "$source_key")")
     elif [[ -z "$candidate_line" ]]; then
-      consumed_compose_env_removal_approvals+=("$record")
+      consumed_compose_env_removal_approvals+=("$(approval_audit_id "$service" "$key" "$source_key")")
     else
-      compose_env_guard_reject "Candidate modified the mapping covered by a staged current approval instead of consuming or revoking it: $record" || return 1
+      compose_env_guard_reject "Candidate modified the mapping covered by a staged current approval instead of consuming or revoking it: service=$service destination=$key source=$source_key." || return 1
     fi
   done
 }

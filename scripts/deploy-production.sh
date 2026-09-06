@@ -105,11 +105,6 @@ read_env_value() {
   printf '%s' "$value"
 }
 
-join_records() {
-  local IFS=';'
-  printf '%s' "$*"
-}
-
 write_release_record() {
   local outcome="$1"
   local staged_approvals="none"
@@ -119,11 +114,11 @@ write_release_record() {
 
   [[ -n "$release_started_at" && -n "$release_short_sha" ]] || return 1
   [[ "${#production_transition_staged_compose_removal_approvals[@]}" -eq 0 ]] ||
-    staged_approvals="$(join_records "${production_transition_staged_compose_removal_approvals[@]}")"
+    staged_approvals="$(join_approval_audit_records "${production_transition_staged_compose_removal_approvals[@]}")"
   [[ "${#production_transition_consumed_compose_removal_approvals[@]}" -eq 0 ]] ||
-    consumed_approvals="$(join_records "${production_transition_consumed_compose_removal_approvals[@]}")"
+    consumed_approvals="$(join_approval_audit_records "${production_transition_consumed_compose_removal_approvals[@]}")"
   [[ "${#production_transition_revoked_compose_removal_approvals[@]}" -eq 0 ]] ||
-    revoked_approvals="$(join_records "${production_transition_revoked_compose_removal_approvals[@]}")"
+    revoked_approvals="$(join_approval_audit_records "${production_transition_revoked_compose_removal_approvals[@]}")"
 
   release_record="$backup_dir/release-$release_started_at-$release_short_sha.txt"
   temp_record="$release_record.tmp.$$"
@@ -282,7 +277,7 @@ release_short_sha="${release_sha:0:12}"
 [[ "$health_attempts" =~ ^[1-9][0-9]*$ ]] || fail "AL_LIO_HEALTH_ATTEMPTS must be a positive integer."
 [[ "$health_interval_seconds" =~ ^[1-9][0-9]*$ ]] || fail "AL_LIO_HEALTH_INTERVAL_SECONDS must be a positive integer."
 
-for command_name in git docker curl flock awk grep install readlink sha256sum tar; do
+for command_name in git docker curl flock awk grep install readlink sha256sum tar mktemp od tr wc; do
   require_command "$command_name"
 done
 

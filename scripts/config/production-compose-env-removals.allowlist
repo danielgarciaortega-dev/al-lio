@@ -9,3 +9,8 @@
 # approval. A newly staged mapping must already exist unchanged in current and
 # candidate Compose. The active release, never the candidate, authorizes the
 # transition. This file must remain a regular non-executable Git blob (100644).
+# The byte contract is printable ASCII with LF or paired CRLF line endings,
+# bounded to 65536 bytes. Tabs, lone CR, NUL and other binary/control bytes are
+# rejected before Bash parsing. Comments must start in column 1, and blank lines
+# must be exactly empty. The fourth field may be empty only to represent the
+# exact Compose form ${VARIABLE:-}; it is never written to logs or records.

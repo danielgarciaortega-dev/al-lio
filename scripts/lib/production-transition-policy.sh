@@ -12,9 +12,11 @@ production_transition_consumed_compose_removal_approvals=()
 production_transition_revoked_compose_removal_approvals=()
 production_transition_added_migrations=()
 production_transition_validated_blob_object=""
+production_transition_validated_approval_data=""
 
 readonly PRODUCTION_TRANSITION_COMPOSE_FILE="infra/docker-compose.prod.yml"
 readonly PRODUCTION_TRANSITION_APPROVALS_REPO_PATH="scripts/config/production-compose-env-removals.allowlist"
+readonly PRODUCTION_TRANSITION_APPROVAL_MAX_BYTES=65536
 readonly -a PRODUCTION_TRANSITION_PROTECTED_CONTROL_PLANE=(
   ".dockerignore"
   ".github/workflows/ci.yml"
@@ -61,6 +63,110 @@ validate_regular_git_blob() {
   production_transition_validated_blob_object="$object"
 }
 
+cleanup_approval_blob_file() {
+  local raw_file="$1"
+  local label="$2"
+
+  if ! rm -f -- "$raw_file"; then
+    production_transition_validated_approval_data=""
+    production_transition_reject "$label private temporary validation file could not be removed." || return 1
+  fi
+}
+
+reject_approval_blob_after_cleanup() {
+  local raw_file="$1"
+  local label="$2"
+  local rejection="$3"
+
+  cleanup_approval_blob_file "$raw_file" "$label" || return 1
+  production_transition_reject "$rejection" || return 1
+}
+
+validate_and_load_approval_blob() {
+  local repository="$1"
+  local object="$2"
+  local label="$3"
+  local blob_size=""
+  local actual_size=""
+  local raw_file=""
+  local byte_dump=""
+  local byte=""
+  local pending_cr=0
+  local -a byte_values=()
+
+  production_transition_validated_approval_data=""
+  blob_size="$(git -C "$repository" cat-file -s "$object" 2>/dev/null)" ||
+    production_transition_reject "$label size cannot be read." || return 1
+  [[ "$blob_size" =~ ^[0-9]+$ ]] ||
+    production_transition_reject "$label has an invalid byte size." || return 1
+  (( blob_size <= PRODUCTION_TRANSITION_APPROVAL_MAX_BYTES )) ||
+    production_transition_reject "$label exceeds the ${PRODUCTION_TRANSITION_APPROVAL_MAX_BYTES}-byte limit." || return 1
+
+  raw_file="$(mktemp "${TMPDIR:-/tmp}/al-lio-approval.XXXXXX")" ||
+    production_transition_reject "$label cannot be prepared for byte validation." || return 1
+  if ! chmod 600 "$raw_file"; then
+    reject_approval_blob_after_cleanup \
+      "$raw_file" \
+      "$label" \
+      "$label temporary validation file cannot be secured." || return 1
+  fi
+  if ! git -C "$repository" cat-file blob "$object" > "$raw_file"; then
+    reject_approval_blob_after_cleanup "$raw_file" "$label" "$label blob cannot be read." || return 1
+  fi
+  actual_size="$(wc -c < "$raw_file")"
+  actual_size="${actual_size//[[:space:]]/}"
+  if [[ "$actual_size" != "$blob_size" ]]; then
+    reject_approval_blob_after_cleanup \
+      "$raw_file" \
+      "$label" \
+      "$label byte length changed while reading the Git object." || return 1
+  fi
+
+  if ! byte_dump="$(LC_ALL=C od -An -v -t u1 "$raw_file")"; then
+    reject_approval_blob_after_cleanup "$raw_file" "$label" "$label bytes cannot be inspected." || return 1
+  fi
+  while read -r -a byte_values; do
+    for byte in "${byte_values[@]}"; do
+      if [[ "$pending_cr" -eq 1 ]]; then
+        if [[ "$byte" != "10" ]]; then
+          reject_approval_blob_after_cleanup \
+            "$raw_file" \
+            "$label" \
+            "$label contains a carriage return that is not part of CRLF." || return 1
+        fi
+        pending_cr=0
+        continue
+      fi
+      case "$byte" in
+        0)
+          reject_approval_blob_after_cleanup "$raw_file" "$label" "$label contains a forbidden NUL byte." || return 1
+          ;;
+        10) ;;
+        13) pending_cr=1 ;;
+        *)
+          if (( byte < 32 || byte > 126 )); then
+            reject_approval_blob_after_cleanup \
+              "$raw_file" \
+              "$label" \
+              "$label contains a forbidden control, binary, or non-ASCII byte." || return 1
+          fi
+          ;;
+      esac
+    done
+  done <<< "$byte_dump"
+  if [[ "$pending_cr" -eq 1 ]]; then
+    reject_approval_blob_after_cleanup \
+      "$raw_file" \
+      "$label" \
+      "$label ends with a carriage return that is not part of CRLF." || return 1
+  fi
+
+  if ! production_transition_validated_approval_data="$(tr -d '\015' < "$raw_file")"; then
+    reject_approval_blob_after_cleanup "$raw_file" "$label" "$label CRLF normalization failed." || return 1
+  fi
+  cleanup_approval_blob_file "$raw_file" "$label" || return 1
+}
+
 validate_production_transition() {
   local repository="$1"
   local current_sha="$2"
@@ -68,6 +174,8 @@ validate_production_transition() {
   local main_ref="${4:-origin/main}"
   local current_approval_data=""
   local candidate_approval_data=""
+  local current_approval_object=""
+  local candidate_approval_object=""
   local protected_control_plane_changes=""
   local blocked_runtime_changes=""
   local migration_changes=""
@@ -85,6 +193,7 @@ validate_production_transition() {
   production_transition_revoked_compose_removal_approvals=()
   production_transition_added_migrations=()
   production_transition_validated_blob_object=""
+  production_transition_validated_approval_data=""
 
   [[ "$current_sha" =~ ^[0-9a-f]{40}$ ]] ||
     production_transition_reject "Current production SHA must be a full lowercase 40-character commit SHA." || return 1
@@ -102,11 +211,14 @@ validate_production_transition() {
     production_transition_reject "The candidate commit would be a downgrade or divergent release. Use the rollback runbook instead." || return 1
 
   validate_regular_git_blob "$repository" "$current_sha" "$PRODUCTION_TRANSITION_APPROVALS_REPO_PATH" "Current release policy data" || return 1
+  current_approval_object="$production_transition_validated_blob_object"
   validate_regular_git_blob "$repository" "$candidate_sha" "$PRODUCTION_TRANSITION_APPROVALS_REPO_PATH" "Candidate release policy data" || return 1
-  current_approval_data="$(git -C "$repository" show "$current_sha:$PRODUCTION_TRANSITION_APPROVALS_REPO_PATH")" ||
-    production_transition_reject "Cannot read current release policy data: $PRODUCTION_TRANSITION_APPROVALS_REPO_PATH" || return 1
-  candidate_approval_data="$(git -C "$repository" show "$candidate_sha:$PRODUCTION_TRANSITION_APPROVALS_REPO_PATH")" ||
-    production_transition_reject "Cannot read candidate release policy data: $PRODUCTION_TRANSITION_APPROVALS_REPO_PATH" || return 1
+  candidate_approval_object="$production_transition_validated_blob_object"
+  validate_and_load_approval_blob "$repository" "$current_approval_object" "Current release policy data" || return 1
+  current_approval_data="$production_transition_validated_approval_data"
+  validate_and_load_approval_blob "$repository" "$candidate_approval_object" "Candidate release policy data" || return 1
+  candidate_approval_data="$production_transition_validated_approval_data"
+  production_transition_validated_approval_data=""
 
   protected_control_plane_changes="$(git -C "$repository" diff --name-only "$current_sha" "$candidate_sha" -- \
     "${PRODUCTION_TRANSITION_PROTECTED_CONTROL_PLANE[@]}")"
@@ -158,20 +270,25 @@ validate_production_transition() {
 
 print_approval_records() {
   local heading="$1"
-  shift
+  local state="$2"
+  shift 2
   local record=""
   local service=""
   local key=""
   local source_key=""
-  local default_value=""
 
   [[ "$#" -gt 0 ]] || return 0
   printf '%s\n' "$heading"
   for record in "$@"; do
-    IFS='|' read -r service key source_key default_value <<< "$record"
-    printf '  - service=%s destination=%s source=%s default=%s\n' \
-      "$service" "$key" "$source_key" "${default_value:-<empty>}"
+    IFS=':' read -r service key source_key <<< "$record"
+    printf '  - service=%s destination=%s source=%s state=%s\n' \
+      "$service" "$key" "$source_key" "$state"
   done
+}
+
+join_approval_audit_records() {
+  local IFS=';'
+  printf '%s' "$*"
 }
 
 print_production_transition_summary() {
@@ -189,12 +306,15 @@ print_production_transition_summary() {
   fi
   print_approval_records \
     "STAGED PRODUCTION COMPOSE REMOVAL APPROVALS:" \
+    "staged" \
     "${production_transition_staged_compose_removal_approvals[@]}"
   print_approval_records \
     "CONSUMED PRODUCTION COMPOSE REMOVAL APPROVALS:" \
+    "consumed" \
     "${production_transition_consumed_compose_removal_approvals[@]}"
   print_approval_records \
     "REVOKED PRODUCTION COMPOSE REMOVAL APPROVALS:" \
+    "revoked" \
     "${production_transition_revoked_compose_removal_approvals[@]}"
   if [[ "${#production_transition_added_migrations[@]}" -gt 0 ]]; then
     printf 'New additive migrations:\n'

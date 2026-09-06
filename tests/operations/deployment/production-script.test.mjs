@@ -77,10 +77,15 @@ test("Compose removals require exact current-release data and cannot persist in 
   const guard = await readFile(composeGuardUrl, "utf8");
   const approvals = await readFile(approvalsUrl, "utf8");
 
-  assert.match(policy, /git -C "\$repository" show "\$current_sha:\$PRODUCTION_TRANSITION_APPROVALS_REPO_PATH"/);
-  assert.match(policy, /git -C "\$repository" show "\$candidate_sha:\$PRODUCTION_TRANSITION_APPROVALS_REPO_PATH"/);
   assert.match(policy, /git -C "\$repository" ls-tree "\$sha" -- "\$path"/);
   assert.match(policy, /100644 blob/);
+  assert.match(policy, /validate_and_load_approval_blob/);
+  assert.match(policy, /cat-file blob "\$object" > "\$raw_file"/);
+  assert.match(policy, /PRODUCTION_TRANSITION_APPROVAL_MAX_BYTES=65536/);
+  assert.match(policy, /od -An -v -t u1/);
+  assert.match(policy, /forbidden NUL byte/);
+  assert.match(policy, /not part of CRLF/);
+  assert.match(policy, /tr -d '\\015'/);
   assert.match(guard, /service\|destination_key\|source_variable\|exact_default/);
   assert.match(guard, /validate_removal_approval_data/);
   assert.match(guard, /classify_approval_transition/);
@@ -99,6 +104,27 @@ test("Compose removals require exact current-release data and cannot persist in 
     "AL_LIO_DEMO_ACCESS_ENABLED",
   ]) {
     assert.doesNotMatch(approvals, new RegExp(`^.*\\|${legacyVariable}\\|`, "m"));
+  }
+});
+
+test("approval blob validation is bounded, private, trap-neutral and ordered before CRLF normalization", async () => {
+  const source = await readFile(deployScriptUrl, "utf8");
+  const policy = await readFile(transitionPolicyUrl, "utf8");
+  const loaderStart = policy.indexOf("validate_and_load_approval_blob() {");
+  const loaderEnd = policy.indexOf("\n}\n\nvalidate_production_transition()", loaderStart);
+  const loader = policy.slice(loaderStart, loaderEnd);
+
+  assert.ok(loaderStart >= 0 && loaderEnd > loaderStart);
+  assert.ok(loader.indexOf('cat-file -s "$object"') < loader.indexOf('mktemp "${TMPDIR:-/tmp}/al-lio-approval.XXXXXX"'));
+  assert.ok(loader.indexOf('od -An -v -t u1 "$raw_file"') < loader.indexOf("tr -d '\\015'"));
+  assert.match(loader, /chmod 600 "\$raw_file"/);
+  assert.match(loader, /actual_size=.*wc -c/);
+  assert.match(loader, /actual_size.*blob_size/);
+  assert.match(policy, /if ! rm -f -- "\$raw_file"/);
+  assert.match(policy, /private temporary validation file could not be removed/);
+  assert.doesNotMatch(loader, /\btrap\b/);
+  for (const command of ["mktemp", "od", "tr", "wc"]) {
+    assert.match(source, new RegExp(`for command_name in [^\\n]*\\b${command}\\b`));
   }
 });
 
@@ -167,10 +193,15 @@ test("candidate worktree integrity is checked before both build and cutover", as
 
 test("success and failure records retain the complete audited release outcome", async () => {
   const source = await readFile(deployScriptUrl, "utf8");
+  const policy = await readFile(transitionPolicyUrl, "utf8");
+  const guard = await readFile(composeGuardUrl, "utf8");
 
   assert.match(source, /write_release_record "approved"/);
   assert.match(source, /write_release_record "failed"/);
   assert.match(source, /chmod 600 "\$temp_record"/);
+  assert.match(source, /join_approval_audit_records/);
+  assert.match(guard, /approval_audit_id/);
+  assert.doesNotMatch(policy, /source=%s default=%s/);
   for (const field of [
     "timestamp_utc", "operator", "current_sha", "candidate_sha",
     "previous_release_path", "previous_image", "candidate_image", "policy_result",

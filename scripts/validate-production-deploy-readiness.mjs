@@ -102,10 +102,42 @@ check(
 );
 check(
   "Compose removals require exact current-release data",
-  transitionPolicy.includes('git -C "$repository" show "$current_sha:$PRODUCTION_TRANSITION_APPROVALS_REPO_PATH"')
-    && transitionPolicy.includes('git -C "$repository" show "$candidate_sha:$PRODUCTION_TRANSITION_APPROVALS_REPO_PATH"')
+  transitionPolicy.includes("validate_and_load_approval_blob")
+    && transitionPolicy.includes('cat-file blob "$object" > "$raw_file"')
     && composeEnvGuard.includes("service|destination_key|source_variable|exact_default")
     && composeEnvGuard.includes('removal_is_approved "$current_approval_data"'),
+);
+check(
+  "approval blobs are byte-validated before Bash parsing",
+  transitionPolicy.includes("PRODUCTION_TRANSITION_APPROVAL_MAX_BYTES=65536")
+    && transitionPolicy.includes("od -An -v -t u1")
+    && transitionPolicy.includes("forbidden NUL byte")
+    && transitionPolicy.includes("not part of CRLF")
+    && transitionPolicy.includes("tr -d '\\015'"),
+);
+check(
+  "approval temporary files are private, cleaned and do not replace caller traps",
+  transitionPolicy.includes('chmod 600 "$raw_file"')
+    && transitionPolicy.includes('if ! rm -f -- "$raw_file"')
+    && transitionPolicy.includes("private temporary validation file could not be removed")
+    && !transitionPolicy.slice(
+      transitionPolicy.indexOf("validate_and_load_approval_blob()"),
+      transitionPolicy.indexOf("validate_production_transition()"),
+    ).includes("trap "),
+);
+check(
+  "deploy preflight requires approval validator commands",
+  ["mktemp", "od", "tr", "wc"].every((command) => (
+    deployScript.match(new RegExp(`for command_name in [^\\n]*\\b${command}\\b`))
+  )),
+);
+check(
+  "approval audit output omits exact defaults",
+  composeEnvGuard.includes("approval_audit_id")
+    && transitionPolicy.includes("state=%s")
+    && transitionPolicy.includes("join_approval_audit_records")
+    && deployScript.includes("join_approval_audit_records")
+    && !transitionPolicy.includes("source=%s default=%s"),
 );
 check(
   "Compose removal approvals expire on the next release",
