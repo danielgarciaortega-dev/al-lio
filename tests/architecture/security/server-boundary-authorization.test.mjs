@@ -4,6 +4,13 @@ import test from "node:test";
 
 import { validateServerBoundaryInventory } from "../../../scripts/check-server-boundary-authorization.mjs";
 
+// Source-level assertion rationale: these architecture tests protect repository-wide
+// authorization invariants that span Next.js Route Handlers, Server Actions and SQL
+// repositories. Executing every boundary would duplicate the existing integration/E2E
+// suites and still would not prove exhaustive file coverage; the filesystem inventory
+// is the mechanically complete boundary here, while runtime auth behaviour remains
+// covered by the focused integration and browser tests.
+
 test("every Route Handler and Server Action file is explicitly classified and satisfies its authorization evidence", () => {
   assert.deepEqual(validateServerBoundaryInventory(), []);
 });
