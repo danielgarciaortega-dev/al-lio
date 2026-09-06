@@ -35,28 +35,144 @@ function read(path) {
 console.log("\n-- scripts/deploy-production.sh --");
 const deployScript = read("scripts/deploy-production.sh");
 const composeEnvGuard = read("scripts/lib/compose-env-guard.sh");
+const transitionPolicy = read("scripts/lib/production-transition-policy.sh");
+const composeRemovalApprovals = read("scripts/config/production-compose-env-removals.allowlist");
+const releaseEnvPreparer = read("scripts/prepare-release-env.sh");
+const releaseWorktreeIntegrity = read("scripts/lib/release-worktree-integrity.sh");
 check("guarded production deploy script exists", existsSync(join(root, "scripts/deploy-production.sh")));
 check("deploy script requires an exact full SHA", deployScript.includes("^[0-9a-f]{40}$"));
-check("deploy script accepts only commits reachable from main", deployScript.includes('merge-base --is-ancestor "$release_sha" origin/main'));
+check("shared production transition policy exists", existsSync(join(root, "scripts/lib/production-transition-policy.sh")));
+check(
+  "deploy script uses the shared current-to-candidate policy",
+  deployScript.includes("lib/production-transition-policy.sh")
+    && deployScript.includes('validate_production_transition "$repository_dir" "$current_sha" "$release_sha" origin/main'),
+);
+check("shared policy accepts only commits reachable from main", transitionPolicy.includes('merge-base --is-ancestor "$candidate_sha" "$main_ref"'));
+check("shared policy rejects downgrades and divergence", transitionPolicy.includes('merge-base --is-ancestor "$current_sha" "$candidate_sha"'));
+check("shared policy protects blocked infrastructure", transitionPolicy.includes("infra/Dockerfile") && transitionPolicy.includes("data/learning-competencies.json"));
+check("shared policy protects migration history", transitionPolicy.includes("Existing migrations are immutable") && transitionPolicy.includes("contains a destructive or structural statement"));
+check(
+  "shared policy protects the production control-plane",
+  [
+    ".dockerignore",
+    ".github/workflows/ci.yml",
+    ".github/workflows/deploy-production.yml",
+    "scripts/deploy-production.sh",
+    "scripts/github-actions-deploy-entrypoint.sh",
+    "scripts/lib/production-transition-policy.sh",
+    "scripts/lib/compose-env-guard.sh",
+    "scripts/lib/release-worktree-integrity.sh",
+    "scripts/prepare-release-env.sh",
+    "scripts/validate-production-transition.sh",
+    "scripts/validate-production-deploy-readiness.mjs",
+    "scripts/postgres",
+    "infra/postgres/schema.sql",
+    "infra/postgres/baseline.sha256",
+  ].every((entry) => transitionPolicy.includes(`"${entry}"`))
+    && transitionPolicy.includes("protected production control-plane"),
+);
+check(
+  "new migrations must be regular 100644 blobs read by object id",
+  transitionPolicy.includes("validate_regular_git_blob")
+    && transitionPolicy.includes('git -C "$repository" cat-file blob "$migration_object"')
+    && transitionPolicy.includes("^infra/postgres/migrations/[0-9]{4}_[a-z0-9_]+\\.sql$"),
+);
 check("deploy script serializes releases", deployScript.includes("flock -n"));
 check("deploy script creates and verifies PostgreSQL backups", deployScript.includes("backup-production.sh") && deployScript.includes("verify-backup-production.sh"));
 check("deploy script rehearses migrations in an isolated database", deployScript.includes("al_lio_rehearsal_"));
 check("deploy script replaces only the web service", deployScript.includes("up -d --no-deps al_lio_web"));
 check("deploy script has an automatic web rollback", deployScript.includes("rollback_web"));
+check(
+  "deploy script verifies active worktree and release identity",
+  deployScript.includes('validate_release_worktree_integrity "$previous_release_dir" "$current_sha"')
+    && deployScript.includes("Current release integrity check failed")
+    && deployScript.includes('read_env_value AL_LIO_RELEASE_SHA "$previous_release_dir/.env"'),
+);
 check("deploy script never removes Compose volumes", !deployScript.includes("down -v") && !deployScript.includes("docker volume rm"));
 check("Compose environment guard exists", existsSync(join(root, "scripts/lib/compose-env-guard.sh")));
 check(
-  "deploy script admits only structurally safe additive service environment mappings",
-  deployScript.includes("validate_compose_env_additions")
-    && deployScript.includes("lib/compose-env-guard.sh")
+  "shared policy admits only classified service environment transitions",
+  transitionPolicy.includes("validate_compose_env_transition")
     && composeEnvGuard.includes("validate_new_environment_mapping")
     && composeEnvGuard.includes("validate_unique_environment_keys")
-    && composeEnvGuard.includes('[[ "$line" == +* ]] || return 1')
+    && composeEnvGuard.includes("removal_is_approved")
     && composeEnvGuard.includes("AL_LIO_RADAR_${key}")
     && composeEnvGuard.includes("DISCOVERY_*")
     && composeEnvGuard.includes("OPENAI_API_KEY"),
 );
-check("deploy script rejects every other Compose edit", deployScript.includes("Docker Compose changed outside the allowlisted service environment passthroughs"));
+check(
+  "Compose removals require exact current-release data",
+  transitionPolicy.includes('git -C "$repository" show "$current_sha:$PRODUCTION_TRANSITION_APPROVALS_REPO_PATH"')
+    && transitionPolicy.includes('git -C "$repository" show "$candidate_sha:$PRODUCTION_TRANSITION_APPROVALS_REPO_PATH"')
+    && composeEnvGuard.includes("service|destination_key|source_variable|exact_default")
+    && composeEnvGuard.includes('removal_is_approved "$current_approval_data"'),
+);
+check(
+  "Compose removal approvals expire on the next release",
+  composeEnvGuard.includes("classify_approval_transition")
+    && composeEnvGuard.includes("Current release has staged removal approvals, so candidate must contain no active approval")
+    && composeEnvGuard.includes("staged_compose_env_removal_approvals")
+    && composeEnvGuard.includes("consumed_compose_env_removal_approvals")
+    && composeEnvGuard.includes("revoked_compose_env_removal_approvals"),
+);
+check(
+  "approval files are regular non-executable blobs from the Git tree",
+  transitionPolicy.includes('git -C "$repository" ls-tree "$sha" -- "$path"')
+    && transitionPolicy.includes('"$mode" == "100644"')
+    && transitionPolicy.includes('"$type" == "blob"'),
+);
+check(
+  "Compose metadata and mode changes fail closed",
+  composeEnvGuard.includes('git -C "$repository" diff --summary')
+    && composeEnvGuard.includes("Compose file metadata or mode changed"),
+);
+check(
+  "normal release contains no reusable legacy removal approval",
+  !/^al_lio_(web|radar)\|/m.test(composeRemovalApprovals)
+    && !/(INFOJOBS|ADZUNA|JOOBLE|AL_LIO_DEMO_ACCESS_ENABLED)/.test(composeRemovalApprovals),
+);
+check("shared policy rejects every other Compose edit", transitionPolicy.includes("Docker Compose changed outside the approved service environment transition policy"));
+check(
+  "release environment is copied privately and receives the exact SHA",
+  releaseEnvPreparer.includes('install -m 600 "$previous_env" "$release_env"')
+    && releaseEnvPreparer.includes('write_env_value AL_LIO_IMAGE_TAG "$release_sha"')
+    && releaseEnvPreparer.includes('write_env_value AL_LIO_RELEASE_SHA "$release_sha"')
+    && releaseEnvPreparer.includes('validate_managed_env_value AL_LIO_IMAGE_TAG "$release_sha"')
+    && releaseEnvPreparer.includes('validate_managed_env_value AL_LIO_RELEASE_SHA "$release_sha"'),
+);
+check(
+  "release worktrees reject tracked, untracked and unexpected ignored files",
+  existsSync(join(root, "scripts/lib/release-worktree-integrity.sh"))
+    && releaseWorktreeIntegrity.includes("status --porcelain --untracked-files=all")
+    && releaseWorktreeIntegrity.includes("status --porcelain --ignored --untracked-files=all")
+    && releaseWorktreeIntegrity.includes('"!! .env"')
+    && !deployScript.includes("--untracked-files=no")
+    && !releaseEnvPreparer.includes("--untracked-files=no"),
+);
+check(
+  "candidate integrity is checked before build and cutover",
+  deployScript.split('validate_release_worktree_integrity "$release_dir" "$release_sha"').length >= 4
+    && deployScript.includes("Candidate integrity check failed before build")
+    && deployScript.includes("Candidate integrity check failed before cutover"),
+);
+check("deploy verifies internal and public release identity", deployScript.includes("/api/version") && deployScript.includes('public_version_result="$release_sha"'));
+check(
+  "deploy rechecks candidate identity immediately before cutover",
+  deployScript.includes("Candidate AL_LIO_IMAGE_TAG changed before cutover")
+    && deployScript.includes("Candidate AL_LIO_RELEASE_SHA changed before cutover")
+    && deployScript.includes('validate_release_worktree_integrity "$release_dir" "$release_sha"')
+    && deployScript.includes("Candidate integrity check failed before cutover"),
+);
+check(
+  "deploy writes private success and failure release records",
+  deployScript.includes('write_release_record "approved"')
+    && deployScript.includes('write_release_record "failed"')
+    && deployScript.includes('chmod 600 "$temp_record"')
+    && deployScript.includes("staged_approvals=")
+    && deployScript.includes("consumed_approvals=")
+    && deployScript.includes("revoked_approvals=")
+    && deployScript.includes("rollback_result="),
+);
 
 console.log("\n-- .github/workflows/deploy-production.yml --");
 const deployWorkflow = read(".github/workflows/deploy-production.yml");
@@ -116,6 +232,7 @@ check("DATABASE_URL uses restricted al_lio_app role", envExample.includes("DATAB
 check("DATABASE_MIGRATION_URL uses admin role", envExample.includes("DATABASE_MIGRATION_URL=postgresql://al_lio:"));
 check("documents shared radar webhook secret", envExample.includes("AL_LIO_RADAR_WEBHOOK_SECRET=REPLACE_ME"));
 check("documents immutable radar image tag", envExample.includes("AL_LIO_RADAR_IMAGE_TAG="));
+check("release identity is not a developer-managed environment placeholder", !envExample.includes("AL_LIO_RELEASE_SHA="));
 check("documents dormant Radar publication defaults", [
   "AL_LIO_RADAR_DELIVERY_SCHEMA_VERSION=3",
   "AL_LIO_RADAR_AUTONOMOUS_PUBLICATION_ENABLED=false",
@@ -168,6 +285,51 @@ check(
   "runbook documents immutable image rollback",
   runbook.includes("AL_LIO_IMAGE_TAG") && runbook.includes("Application rollback"),
 );
+check(
+  "runbook preserves immutable release topology for exceptional deploys",
+  runbook.includes("/srv/danicode/releases/al-lio-")
+    && runbook.includes("worktree add --detach")
+    && runbook.includes("prepare-release-env.sh")
+    && !runbook.includes("git checkout --detach"),
+);
+check("runbook verifies the exact public release identity", runbook.includes("/api/version") && runbook.includes("AL_LIO_RELEASE_SHA"));
+check(
+  "runbook gives executable backup, restore-test and rehearsal commands",
+  runbook.includes("backup-production.sh")
+    && runbook.includes("verify-backup-production.sh")
+    && runbook.includes("al_lio_rehearsal_")
+    && runbook.includes("pg_restore")
+    && runbook.includes("schema_migrations"),
+);
+check(
+  "runbook preserves Radar around migrations",
+  runbook.includes("docker stop --time 30 al_lio_radar")
+    && runbook.includes("al_lio_radar_data:/source:ro")
+    && runbook.includes("docker start al_lio_radar"),
+);
+check(
+  "runbook gives executable cutover, smoke, record and rollback commands",
+  runbook.includes("up -d --no-deps al_lio_web")
+    && runbook.includes("/api/job-radar")
+    && runbook.includes("release-$AL_LIO_RELEASE_STARTED_AT")
+    && runbook.includes("rollback_image"),
+);
+check(
+  "runbook includes the owner functional smoke and web-only persistence check",
+  [
+    "login", "Google OAuth", "Calendar connect/disconnect", "dashboard",
+    "Create/complete/delete task", "Create note + reload", "profile/cycle persistence",
+    "Radar visibility", "idempotent delivery", "Work", "Courses", "Events/Challenges",
+    "docker restart al_lio_web",
+  ].every((entry) => runbook.includes(entry)),
+);
+
+console.log("\n-- src/app/api/version/route.ts --");
+const versionRoute = read("src/app/api/version/route.ts");
+check("version endpoint exists", existsSync(join(root, "src/app/api/version/route.ts")));
+check("version endpoint validates a full lowercase SHA", versionRoute.includes("^[0-9a-f]{40}$"));
+check("version endpoint fails explicitly when identity is unavailable", versionRoute.includes("releaseSha: null") && versionRoute.includes("status: 503"));
+check("version endpoint disables caching", versionRoute.includes('"Cache-Control": "no-store"'));
 
 console.log("\n-- docs/operations/PRIMARY_DOMAIN_MIGRATION.md --");
 const domainMigration = read("docs/operations/PRIMARY_DOMAIN_MIGRATION.md");

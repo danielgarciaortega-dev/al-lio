@@ -17,6 +17,7 @@ services:
     environment:
       NODE_ENV: production
       PORT: "3000"
+      AL_LIO_RELEASE_SHA: ${AL_LIO_RELEASE_SHA:?AL_LIO_RELEASE_SHA is injected by the release mechanism}
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
       AL_LIO_RADAR_WEBHOOK_SECRET: ${AL_LIO_RADAR_WEBHOOK_SECRET:?AL_LIO_RADAR_WEBHOOK_SECRET is required}

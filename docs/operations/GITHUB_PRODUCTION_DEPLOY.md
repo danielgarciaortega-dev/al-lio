@@ -16,8 +16,10 @@ command remains available for recovery.
 6. The restricted SSH key can invoke only `deploy <SHA>`.
 7. The forced VPS entrypoint calls `scripts/deploy-production.sh` from the
    currently healthy release.
-8. The guarded script builds, audits migrations, replaces only the web service,
-   verifies health/readiness and rolls the web service back on failure.
+8. One shared policy validates the active SHA to candidate SHA transition.
+9. The guarded script builds, audits migrations, replaces only the web service,
+   verifies health, readiness and exact release identity, and rolls the web
+   service back on failure.
 
 The deployment workflow is serialized with `cancel-in-progress: false`. A
 release already changing production is never interrupted by a newer merge. The
@@ -112,11 +114,38 @@ Repeatedly dispatching the SHA already running is a safe health-checked no-op.
 - A build failure leaves the current production web container untouched.
 - A failure after web replacement invokes the existing automatic rollback.
 - Infrastructure, Radar, operator-managed catalogue and non-additive migration
-  changes stop and require [`DEPLOY_VPS.md`](DEPLOY_VPS.md). The only Compose
-  exception is a strictly additive, namespaced environment passthrough under
-  `al_lio_web` or `al_lio_radar`. The guard validates the service, target key,
-  host-variable namespace, default syntax, placement and uniqueness. Any removal,
-  modification, relocation, duplicate or unrelated edit fails closed.
+  changes stop and require [`DEPLOY_VPS.md`](DEPLOY_VPS.md).
+- Compose permits a strictly namespaced environment addition under
+  `al_lio_web` or `al_lio_radar`, or one exact removal pre-approved by the
+  active release. An approval records the service, destination key, source
+  variable and exact default as inert data.
+- A removal takes two releases. Release A adds the exact approval without
+  changing Compose. Release B removes both the mapping and the approval. The
+  transition reads authorization from A's Git object and requires B not to
+  retain it, so B cannot authorize its own removal or leave a reusable grant.
+- Every staged approval expires at the next transition. If the mapping is not
+  removed, the next release must revoke the approval; an unchanged approval
+  cannot survive across multiple releases. When the active release contains
+  any approval, the candidate approval file must contain no active records, so
+  approvals cannot be retained, replaced or combined with newly staged grants.
+- Approval data is accepted only from a `100644` regular blob in each Git tree.
+  Executable files, symlinks, gitlinks and unknown types fail closed.
+- Modifications, moves between services, duplicates, reorderings, wildcards,
+  stale approvals and unrelated Compose changes fail closed.
+- A successful cutover requires `/api/version` to report the requested full SHA
+  both inside the web container and through `https://al-lio.app`.
+
+`production-transition-policy.sh` currently exposes the post-merge deployment
+contract: release eligibility (the candidate is already reachable from
+`origin/main`) and current-to-candidate transition safety are invoked together.
+PR2 must reuse or extract the transition-safety core for pre-merge evaluation
+without treating main reachability as proof that a proposed change is safe.
+
+The migration statement detector is a conservative blacklist for known
+destructive or structural SQL. Passing it does not prove that a migration is
+semantically non-destructive. Backup, restore verification, rehearsal,
+additive migration discipline and rollback-compatible application changes
+remain mandatory.
 
 If a workflow reports `CRITICAL`, disable
 `PRODUCTION_AUTO_DEPLOY_ENABLED`, prevent further merges and follow the manual

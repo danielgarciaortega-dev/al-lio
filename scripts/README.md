@@ -76,9 +76,21 @@ boundaries instead of broad ignore patterns.
 | Script | npm alias | Purpose |
 |---|---|---|
 | `deploy-production.sh` | — | Runs on the VPS. Pins a reviewed forward-only `main` SHA, backs up, deploys, smoke-tests, can roll back. |
-| `lib/compose-env-guard.sh` | — | Allows only structurally safe additive AL-LÍO/Radar service environment passthroughs during routine releases. |
+| `lib/production-transition-policy.sh` | — | Single fail-closed current-SHA to candidate-SHA policy used by deployment, tests and future CI. |
+| `lib/release-worktree-integrity.sh` | — | Rejects tracked, untracked and unexpected ignored files so the Docker build context stays attributable to the candidate SHA. |
+| `validate-production-transition.sh` | — | Read-only CLI for the shared transition policy. |
+| `lib/compose-env-guard.sh` | — | Classifies safe namespaced additions and exact, current-release-approved consumable removals; rejects all other Compose changes. |
+| `config/production-compose-env-removals.allowlist` | — | Inert exact removal approvals. Normally empty; each approval expires at the next transition through consumption or revocation. |
+| `prepare-release-env.sh` | — | Copies a private release `.env` and injects the exact image and public release SHA. |
 | `github-actions-deploy-entrypoint.sh` | — | Entry point the deploy workflow calls over SSH. |
 | `validate-production-deploy-readiness.mjs` | `validate:production-deploy`, `validate:deploy` | Static pre-deploy readiness checks against repo files and runbooks. |
+
+Routine releases cannot change the production control-plane that judges or
+executes their transition: the CI/deploy workflows, forced SSH entrypoint,
+deployment and transition helpers, `.dockerignore`, PostgreSQL operational
+scripts, baseline schema and baseline checksum. Those changes require the
+explicit exceptional procedure in `docs/operations/DEPLOY_VPS.md`. Compose and
+new migrations retain their narrower, separately tested transition policies.
 
 ## Database integrity
 

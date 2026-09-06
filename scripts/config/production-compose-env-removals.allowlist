@@ -1,0 +1,11 @@
+# Consumable production Compose environment-removal approvals.
+# Format: service|destination_key|source_variable|exact_default
+#
+# Keep this file empty during normal operation. To retire a mapping, deploy an
+# approval-only release first. The immediately following release must either
+# remove the exact mapping or revoke the approval, and must remove the approval
+# in both cases. If current has any active record, candidate must have no active
+# records: an approval cannot survive, be replaced, or be combined with a new
+# approval. A newly staged mapping must already exist unchanged in current and
+# candidate Compose. The active release, never the candidate, authorizes the
+# transition. This file must remain a regular non-executable Git blob (100644).

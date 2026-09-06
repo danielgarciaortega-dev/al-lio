@@ -186,6 +186,14 @@
       "requiredEvidence": []
     },
     {
+      "path": "src/app/api/version/route.ts",
+      "kind": "route-handler",
+      "classification": "public",
+      "guard": "minimal immutable release identity only",
+      "ownershipSource": "none",
+      "requiredEvidence": ["releaseSha", "Cache-Control"]
+    },
+    {
       "path": "src/app/api/tech-opportunities/route.ts",
       "kind": "route-handler",
       "classification": "authenticated",
