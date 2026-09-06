@@ -53,7 +53,7 @@ for (const file of requiredFiles) {
 }
 
 const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-for (const script of ["lint", "typecheck", "check:project", "check:boundaries", "audit:schema", "smoke", "verify:startup", "verify:cheap", "verify:prod", "test", "ci"]) {
+for (const script of ["lint", "typecheck", "check:project", "check:boundaries", "check:authorization-boundaries", "audit:schema", "smoke", "verify:startup", "verify:cheap", "verify:prod", "test", "ci"]) {
   if (!packageJson.scripts?.[script]) {
     fail(`Falta el script npm: ${script}`);
   }
