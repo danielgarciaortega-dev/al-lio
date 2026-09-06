@@ -1,0 +1,49 @@
+name: Refresh Next 15 security lockfile
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - package.json
+      - .github/workflows/next-15-lockfile-refresh.yml
+
+permissions:
+  contents: write
+
+jobs:
+  refresh-lockfile:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'security/next-15.5.25'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out security branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: security/next-15.5.25
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Pin npm used by repository lockfile maintenance
+        run: npm install --global npm@10.9.8
+
+      - name: Regenerate package lock only
+        run: npm install --package-lock-only --ignore-scripts
+
+      - name: Commit regenerated lockfile
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json
+          if git diff --cached --quiet; then
+            echo "package-lock.json is already current"
+            exit 0
+          fi
+          git commit -m "chore(deps): refresh lockfile for Next.js 15.5.25"
+          git push origin HEAD:security/next-15.5.25
