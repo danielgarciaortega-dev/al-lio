@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join, relative, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, relative, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const root = process.cwd();
 const inventoryPath = join(root, "config/security/server-boundaries.json");
@@ -165,7 +165,7 @@ export function runServerBoundaryAuthorizationCheck() {
   console.log(`OK: server-boundary authorization inventory verified (${routeCount} routes, ${actionCount} action files, ${readCount} explicit private reads).`);
 }
 
-const invokedPath = process.argv[1] ? fileURLToPath(new URL(`file://${process.argv[1]}`)) : null;
-if (invokedPath && invokedPath === fileURLToPath(import.meta.url)) {
+const invokedUrl = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null;
+if (invokedUrl === import.meta.url) {
   runServerBoundaryAuthorizationCheck();
 }
