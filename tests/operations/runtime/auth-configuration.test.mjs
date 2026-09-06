@@ -23,7 +23,7 @@ test("Development startup loads Next.js env files and validates auth secrets bef
   assert.match(validatorSource, /const baseUrl = parseUrl\("BASE_URL", production\);/);
   assert.match(validatorSource, /requiredSecret\("AL_LIO_RADAR_WEBHOOK_SECRET", 32, production\);/);
   assert.match(packageJson.scripts["verify:startup"], /^npm run validate:runtime && /);
-  assert.equal(packageJson.devDependencies["@next/env"], "15.5.23");
+  assert.equal(packageJson.devDependencies["@next/env"], packageJson.dependencies.next);
 });
 
 test("The review event seed is explicit, idempotent and restricted to one named local account", async () => {
