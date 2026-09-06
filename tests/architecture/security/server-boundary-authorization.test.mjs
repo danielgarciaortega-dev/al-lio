@@ -25,8 +25,10 @@ test("validated sessions fail closed when the database security stamp no longer 
 
 test("administrator authority is re-read from the database rather than trusted from a client or token role", async () => {
   const source = await readFile(new URL("../../../src/lib/auth/authorization.ts", import.meta.url), "utf8");
+  assert.match(source, /async function getCurrentUser\(\)/);
   assert.match(source, /const session = await getValidatedSession\(\);/);
-  assert.match(source, /const user = await getUserById\(session\.uid\);/);
+  assert.match(source, /return getUserById\(session\.uid\);/);
+  assert.match(source, /const user = await getCurrentUser\(\);/);
   assert.match(source, /user\.role !== "admin"/);
   assert.doesNotMatch(source, /session\.role|searchParams.*role|formData.*role/);
 });
