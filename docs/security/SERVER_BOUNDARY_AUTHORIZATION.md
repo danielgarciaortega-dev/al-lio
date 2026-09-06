@@ -62,7 +62,7 @@ The check fails when:
 - an admin boundary stops using `requireAdminUser()`;
 - an internal Radar boundary stops verifying the signed webhook.
 
-The check is part of `verify:startup`, so it runs in the normal CI verification path before merge.
+The checker is part of `verify:startup`. The architecture test also invokes the same validator during `test:all`, so the normal CI workflow fails before merge if the inventory or required authorization evidence drifts.
 
 ## Residual scope
 
