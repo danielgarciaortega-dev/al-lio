@@ -1,0 +1,349 @@
+{
+  "version": 1,
+  "classifications": [
+    "public",
+    "authenticated",
+    "user-owned",
+    "admin-only",
+    "internal-signed",
+    "provider-callback"
+  ],
+  "boundaries": [
+    {
+      "path": "src/app/(auth)/confirmar/route.ts",
+      "kind": "route-handler",
+      "classification": "public",
+      "guard": "single-use email confirmation capability",
+      "ownershipSource": "confirmed token subject",
+      "requiredEvidence": ["confirmEmailToken(token)"]
+    },
+    {
+      "path": "src/app/favicon.ico/route.ts",
+      "kind": "route-handler",
+      "classification": "public",
+      "guard": "static asset only",
+      "ownershipSource": "none",
+      "requiredEvidence": []
+    },
+    {
+      "path": "src/app/api/auth/google/callback/route.ts",
+      "kind": "route-handler",
+      "classification": "provider-callback",
+      "guard": "Google OAuth state plus PKCE verifier",
+      "ownershipSource": "verified Google identity",
+      "requiredEvidence": ["assertGoogleIdentityState(state)", "consumeGoogleIdentityVerifier()", "exchangeGoogleIdentityCode(code, codeVerifier)"]
+    },
+    {
+      "path": "src/app/api/auth/google/start/route.ts",
+      "kind": "route-handler",
+      "classification": "public",
+      "guard": "OAuth state and PKCE bootstrap",
+      "ownershipSource": "none",
+      "requiredEvidence": ["createGoogleIdentityAuthUrl"]
+    },
+    {
+      "path": "src/app/api/auth/logout-stale/route.ts",
+      "kind": "route-handler",
+      "classification": "public",
+      "guard": "caller-cookie clear only",
+      "ownershipSource": "caller cookie",
+      "requiredEvidence": ["clearSession()"]
+    },
+    {
+      "path": "src/app/api/collect/route.ts",
+      "kind": "route-handler",
+      "classification": "public",
+      "guard": "retired endpoint; always 410",
+      "ownershipSource": "none",
+      "requiredEvidence": ["status: 410"]
+    },
+    {
+      "path": "src/app/api/google/calendar/auth/route.ts",
+      "kind": "route-handler",
+      "classification": "authenticated",
+      "guard": "database-validated session",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getValidatedSession()"]
+    },
+    {
+      "path": "src/app/api/google/calendar/callback/route.ts",
+      "kind": "route-handler",
+      "classification": "provider-callback",
+      "guard": "database-validated session plus OAuth state",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getValidatedSession()", "assertGoogleOAuthState(state)", "saveGoogleTokens(session.uid, tokens)"]
+    },
+    {
+      "path": "src/app/api/google/calendar/events/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session and user-owned Google credentials",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getValidatedSession()", "getGoogleCalendarClient(session.uid)"]
+    },
+    {
+      "path": "src/app/api/google/calendar/status/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session and credential-owner check",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getValidatedSession()", "getCalendarCredentialStatus(session.uid)"]
+    },
+    {
+      "path": "src/app/api/health/route.ts",
+      "kind": "route-handler",
+      "classification": "public",
+      "guard": "minimal liveness response only",
+      "ownershipSource": "none",
+      "requiredEvidence": []
+    },
+    {
+      "path": "src/app/api/job-radar/[id]/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session; repository scopes by user_id",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["tryGetCurrentUserId()"]
+    },
+    {
+      "path": "src/app/api/job-radar/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session; repository scopes by user_id",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["tryGetCurrentUserId()"]
+    },
+    {
+      "path": "src/app/api/job-radar/sync/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session plus durable per-user sync guard",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["tryGetCurrentUserId()", "acquireJobRadarSyncGuard(userId)"]
+    },
+    {
+      "path": "src/app/api/news/[id]/read/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session plus server-derived cycle",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["tryGetCurrentUserId()", "getProfileByUser(userId)", "setRadarItemStatus(userId, profile.cycle_code"]
+    },
+    {
+      "path": "src/app/api/news/[id]/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session plus server-derived cycle",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["tryGetCurrentUserId()", "getProfileByUser(userId)", "getRadarItemDetailForUser(userId, profile.cycle_code"]
+    },
+    {
+      "path": "src/app/api/news/[id]/save/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session plus server-derived cycle",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["tryGetCurrentUserId()", "getProfileByUser(userId)", "setRadarItemStatus(userId, profile.cycle_code"]
+    },
+    {
+      "path": "src/app/api/news/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session plus server-derived cycle",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["tryGetCurrentUserId()", "getProfileByUser(userId)", "listRadarItemsForCycle(userId, profile.cycle_code"]
+    },
+    {
+      "path": "src/app/api/news/sync/route.ts",
+      "kind": "route-handler",
+      "classification": "public",
+      "guard": "retired endpoint; always 410",
+      "ownershipSource": "none",
+      "requiredEvidence": ["status: 410"]
+    },
+    {
+      "path": "src/app/api/radar/v1/ingest/route.ts",
+      "kind": "route-handler",
+      "classification": "internal-signed",
+      "guard": "HMAC signature, timestamp window, delivery id and schema version",
+      "ownershipSource": "signed Radar delivery",
+      "requiredEvidence": ["verifyRadarWebhook(request, rawBody)"]
+    },
+    {
+      "path": "src/app/api/radar/v1/learning/route.ts",
+      "kind": "route-handler",
+      "classification": "internal-signed",
+      "guard": "feature gate plus HMAC signature, timestamp window and schema version",
+      "ownershipSource": "signed Radar delivery",
+      "requiredEvidence": ["AL_LIO_RADAR_LEARNING_INGEST_ENABLED", "verifyRadarWebhook(request, rawBody"]
+    },
+    {
+      "path": "src/app/api/ready/route.ts",
+      "kind": "route-handler",
+      "classification": "public",
+      "guard": "minimal readiness response only",
+      "ownershipSource": "none",
+      "requiredEvidence": []
+    },
+    {
+      "path": "src/app/api/tech-opportunities/route.ts",
+      "kind": "route-handler",
+      "classification": "authenticated",
+      "guard": "database-validated session",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["tryGetCurrentUserId()"]
+    },
+    {
+      "path": "src/app/api/verified-jobs/[id]/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session plus server-derived cycle",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["tryGetCurrentUserId()", "getProfileByUser(userId)", "userId,", "cycleCode: profile.cycle_code"]
+    },
+    {
+      "path": "src/app/api/verified-jobs/route.ts",
+      "kind": "route-handler",
+      "classification": "user-owned",
+      "guard": "database-validated session plus server-derived cycle",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["tryGetCurrentUserId()", "getProfileByUser(userId)", "listVerifiedJobsForUser(userId, profile.cycle_code"]
+    },
+    {
+      "path": "src/features/auth/server/sign-out.ts",
+      "kind": "server-action",
+      "classification": "public",
+      "guard": "caller-cookie clear only",
+      "ownershipSource": "caller cookie",
+      "requiredEvidence": ["clearSession()"]
+    },
+    {
+      "path": "src/features/bloc/server/actions.ts",
+      "kind": "server-action",
+      "classification": "user-owned",
+      "guard": "database-validated session",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getCurrentUserId()"]
+    },
+    {
+      "path": "src/features/courses/server/actions.ts",
+      "kind": "server-action",
+      "classification": "user-owned",
+      "guard": "database-validated session",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getCurrentUserId()"]
+    },
+    {
+      "path": "src/features/events/server/actions.ts",
+      "kind": "server-action",
+      "classification": "user-owned",
+      "guard": "database-validated session",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getCurrentUserId()"]
+    },
+    {
+      "path": "src/features/learning/server/actions.ts",
+      "kind": "server-action",
+      "classification": "user-owned",
+      "guard": "database-validated session plus server-derived cycle/resource membership",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getCurrentUserId()", "getProfileByUser(userId)"]
+    },
+    {
+      "path": "src/features/learning/server/player-actions.ts",
+      "kind": "server-action",
+      "classification": "user-owned",
+      "guard": "database-validated session plus server-derived cycle/resource membership",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getValidatedSession()", "getAuthorizedResource(session.uid"]
+    },
+    {
+      "path": "src/features/tasks/server/actions.ts",
+      "kind": "server-action",
+      "classification": "user-owned",
+      "guard": "database-validated session; repository scopes mutations by user_id",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getCurrentUserId()"]
+    },
+    {
+      "path": "src/features/work/server/actions.ts",
+      "kind": "server-action",
+      "classification": "user-owned",
+      "guard": "database-validated session",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getValidatedSession()", "session.uid"]
+    },
+    {
+      "path": "src/lib/auth/password-login.ts",
+      "kind": "server-action",
+      "classification": "public",
+      "guard": "credential verification plus durable authentication rate limit",
+      "ownershipSource": "authenticated account record",
+      "requiredEvidence": ["consumeAuthRateLimit", "getUserByEmail(email)", "createSession"]
+    },
+    {
+      "path": "src/lib/auth/password-reset.ts",
+      "kind": "server-action",
+      "classification": "public",
+      "guard": "single-use reset capability plus atomic session revocation",
+      "ownershipSource": "validated reset token subject",
+      "requiredEvidence": ["inspectAuthToken", "resetPasswordAndRevokeSessions", "createSession"]
+    },
+    {
+      "path": "src/lib/auth/register.ts",
+      "kind": "server-action",
+      "classification": "public",
+      "guard": "validated credentials plus durable registration rate limit",
+      "ownershipSource": "new or existing account email",
+      "requiredEvidence": ["consumeAuthRateLimit", "createUnconfirmedUser"]
+    },
+    {
+      "path": "src/lib/onboarding/tour-actions.ts",
+      "kind": "server-action",
+      "classification": "user-owned",
+      "guard": "database-validated session",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getValidatedSession()"]
+    },
+    {
+      "path": "src/lib/profile/onboarding-actions.ts",
+      "kind": "server-action",
+      "classification": "user-owned",
+      "guard": "database-validated session",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getValidatedSession()", "upsertProfile(session.uid"]
+    },
+    {
+      "path": "src/lib/data.ts",
+      "kind": "server-read",
+      "classification": "user-owned",
+      "guard": "authenticated student context performs database-backed session revocation check",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getAuthenticatedStudentContext()"]
+    },
+    {
+      "path": "src/app/(dashboard)/profile/page.tsx",
+      "kind": "server-read",
+      "classification": "user-owned",
+      "guard": "database-validated session",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getValidatedSession()", "getProfileByUser(session.uid)"]
+    },
+    {
+      "path": "src/app/(dashboard)/settings/page.tsx",
+      "kind": "server-read",
+      "classification": "admin-only",
+      "guard": "server-derived administrator role",
+      "ownershipSource": "database user role",
+      "requiredEvidence": ["requireAdminUser()"]
+    },
+    {
+      "path": "src/app/(dashboard)/work/jobs/[id]/page.tsx",
+      "kind": "server-read",
+      "classification": "user-owned",
+      "guard": "database-validated session plus server-derived cycle",
+      "ownershipSource": "session.uid",
+      "requiredEvidence": ["getCurrentUserId()", "getProfileByUser(userId)", "getVerifiedJobForUser(userId, profile.cycle_code"]
+    }
+  ]
+}
