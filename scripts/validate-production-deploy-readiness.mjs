@@ -32,6 +32,88 @@ function read(path) {
   return existsSync(fullPath) ? readFileSync(fullPath, "utf-8").replace(/\r\n/g, "\n") : "";
 }
 
+function shellTextOutsideQuotes(line, maskDoubleQuotes) {
+  let result = "";
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < line.length; index++) {
+    const character = line[index];
+    if (escaped) {
+      result += quote ? " " : character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      result += quote ? " " : character;
+      escaped = true;
+      continue;
+    }
+    if (quote === "'") {
+      result += " ";
+      if (character === "'") quote = "";
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = "";
+        result += " ";
+      } else {
+        result += maskDoubleQuotes ? " " : character;
+      }
+      continue;
+    }
+    if (character === "'") {
+      quote = "'";
+      result += " ";
+      continue;
+    }
+    if (character === '"') {
+      quote = '"';
+      result += " ";
+      continue;
+    }
+    if (character === "#" && (index === 0 || /\s/.test(line[index - 1]))) break;
+    result += character;
+  }
+  return result;
+}
+
+const shellCommandBoundary = String.raw`(?:^\s*|(?:&&|\|\||[;|!(])\s*|\b(?:if|elif|while|until|then|do)\s+)`;
+const shellCommandWrappers = String.raw`(?:(?:command\s+)|(?:env(?:\s+[A-Za-z_][A-Za-z0-9_]*=[^\s]+)+\s+))*`;
+const curlInvocationPattern = new RegExp(`${shellCommandBoundary}${shellCommandWrappers}curl(?:\\s|$)`);
+const curlSubstitutionPattern = new RegExp(String.raw`\$\(\s*${shellCommandWrappers}curl(?:\s|$)`);
+const dockerWgetCommand = String.raw`${shellCommandWrappers}(?:timeout\s+\S+\s+)?docker\s+exec\b.*\bwget(?:\s|$)`;
+const dockerWgetInvocationPattern = new RegExp(`${shellCommandBoundary}${dockerWgetCommand}`);
+const dockerWgetSubstitutionPattern = new RegExp(String.raw`\$\(\s*${dockerWgetCommand}`);
+
+function isCurlInvocation(line) {
+  return curlInvocationPattern.test(shellTextOutsideQuotes(line, true))
+    || curlSubstitutionPattern.test(shellTextOutsideQuotes(line, false));
+}
+
+function isDockerExecWgetInvocation(line) {
+  return dockerWgetInvocationPattern.test(shellTextOutsideQuotes(line, true))
+    || dockerWgetSubstitutionPattern.test(shellTextOutsideQuotes(line, false));
+}
+
+function classifyCurlLine(line) {
+  if (!/\bcurl\b/.test(line)) return "absent";
+  if (isCurlInvocation(line)) return "invocation";
+  const command = line.trim();
+  if (command.startsWith("#") || /^for\s+command_name\b.*\bcurl\b/.test(command)) return "excluded";
+  if (!/\bcurl\b/.test(shellTextOutsideQuotes(line, true))) return "excluded";
+  return "unclassified";
+}
+
+function classifyDockerExecWgetLine(line) {
+  if (!/\bdocker\s+exec\b.*\bwget\b/.test(line)) return "absent";
+  if (isDockerExecWgetInvocation(line)) return "invocation";
+  const command = line.trim();
+  if (command.startsWith("#")) return "excluded";
+  if (!/\bdocker\s+exec\b.*\bwget\b/.test(shellTextOutsideQuotes(line, true))) return "excluded";
+  return "unclassified";
+}
+
 console.log("\n-- scripts/deploy-production.sh --");
 const deployScript = read("scripts/deploy-production.sh");
 const composeEnvGuard = read("scripts/lib/compose-env-guard.sh");
@@ -40,6 +122,53 @@ const composeRemovalApprovals = read("scripts/config/production-compose-env-remo
 const releaseEnvPreparer = read("scripts/prepare-release-env.sh");
 const releaseWorktreeIntegrity = read("scripts/lib/release-worktree-integrity.sh");
 const gitAttributes = read(".gitattributes");
+const productionShellLines = deployScript.split("\n");
+const productionCurlClassifications = productionShellLines.map((line) => ({ line, kind: classifyCurlLine(line) }));
+const productionWgetClassifications = productionShellLines.map((line) => ({ line, kind: classifyDockerExecWgetLine(line) }));
+const productionCurlProbeLines = productionCurlClassifications
+  .filter(({ kind }) => kind === "invocation")
+  .map(({ line }) => line);
+const productionWgetProbeLines = productionWgetClassifications
+  .filter(({ kind }) => kind === "invocation")
+  .map(({ line }) => line);
+const unclassifiedProductionHttpLines = [
+  ...productionCurlClassifications,
+  ...productionWgetClassifications,
+].filter(({ kind }) => kind === "unclassified");
+const productionHttpProbeLines = [...productionCurlProbeLines, ...productionWgetProbeLines];
+check(
+  "HTTP invocation discovery classifies wrappers, exclusions and unknown forms fail closed",
+  [
+    "curl https://example.test/api/future",
+    "command curl https://example.test/api/future",
+    "env FOO=bar curl https://example.test/api/future",
+    'result="$(curl https://example.test/api/future)"',
+    "if curl https://example.test/api/future; then :; fi",
+    "foo && curl https://example.test/api/future",
+    "! curl https://example.test/api/future",
+  ].every((line) => classifyCurlLine(line) === "invocation")
+    && [
+      "docker exec web wget http://127.0.0.1/api/future",
+      "timeout 20s docker exec web wget -T 5 http://127.0.0.1/api/future",
+      "command docker exec web wget http://127.0.0.1/api/future",
+      "env FOO=bar docker exec web wget http://127.0.0.1/api/future",
+    ].every((line) => classifyDockerExecWgetLine(line) === "invocation")
+    && [
+      "# curl https://example.test/api/future",
+      "for command_name in git curl timeout; do",
+      'documentation="curl https://example.test/api/future"',
+      'printf \'curl https://example.test/api/future\\n\'',
+      'echo "curl https://example.test/api/future"',
+    ].every((line) => classifyCurlLine(line) === "excluded")
+    && [
+      "# docker exec web wget http://127.0.0.1/api/future",
+      'documentation="docker exec web wget http://127.0.0.1/api/future"',
+      'printf \'docker exec web wget /api/future\\n\'',
+      'echo "docker exec web wget /api/future"',
+    ].every((line) => classifyDockerExecWgetLine(line) === "excluded")
+    && classifyCurlLine("sudo curl https://example.test/api/future") === "unclassified"
+    && classifyDockerExecWgetLine("sudo docker exec web wget /api/future") === "unclassified",
+);
 check("guarded production deploy script exists", existsSync(join(root, "scripts/deploy-production.sh")));
 check("deploy script requires an exact full SHA", deployScript.includes("^[0-9a-f]{40}$"));
 check("shared production transition policy exists", existsSync(join(root, "scripts/lib/production-transition-policy.sh")));
@@ -82,7 +211,29 @@ check(
     && transitionPolicy.includes("^infra/postgres/migrations/[0-9]{4}_[a-z0-9_]+\\.sql$"),
 );
 check("deploy script serializes releases", deployScript.includes("flock -n"));
-check("deploy script creates and verifies PostgreSQL backups", deployScript.includes("backup-production.sh") && deployScript.includes("verify-backup-production.sh"));
+check(
+  "deploy script binds restore and release provenance to the exact declared PostgreSQL backup",
+  deployScript.includes('backup_output="$(')
+    && deployScript.includes('validate_postgres_backup_output "$backup_output"')
+    && deployScript.includes('"$declared_checksum_file" == "$postgres_backup_file.sha256"')
+    && deployScript.includes('"${checksum_lines[0]}" == "$calculated_checksum  $postgres_backup_file"')
+    && deployScript.includes('sha256sum --check "$declared_checksum_file"')
+    && deployScript.includes('verify-backup-production.sh" "$postgres_backup_file"')
+    && deployScript.includes('--no-acl < "$postgres_backup_file"')
+    && deployScript.includes("printf 'db_backup_path=%s\\n' \"${postgres_backup_file:-not-required}\"")
+    && !deployScript.includes('ls -1t "$backup_dir"/al_lio_*.dump'),
+);
+check(
+  "every routine production HTTP probe has connection and overall bounds",
+  unclassifiedProductionHttpLines.length === 0
+    && productionCurlProbeLines.length === 7
+    && productionWgetProbeLines.length === 3
+    && productionCurlProbeLines.every((line) => /\bcurl\b.*--connect-timeout 5\b.*--max-time 20\b/.test(line))
+    && productionWgetProbeLines.every((line) => /timeout 20s docker exec\b.*\bwget -T 5\b/.test(line))
+    && ["health", "ready", "version", "job-radar"].every((endpoint) =>
+      productionHttpProbeLines.some((line) => line.includes(`/api/${endpoint}`)))
+    && /for command_name in [^\n]*\btimeout\b/.test(deployScript),
+);
 check("deploy script rehearses migrations in an isolated database", deployScript.includes("al_lio_rehearsal_"));
 check("deploy script replaces only the web service", deployScript.includes("up -d --no-deps al_lio_web"));
 check("deploy script has an automatic web rollback", deployScript.includes("rollback_web"));

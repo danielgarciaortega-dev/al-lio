@@ -105,6 +105,56 @@ read_env_value() {
   printf '%s' "$value"
 }
 
+validate_postgres_backup_output() {
+  local backup_output="$1"
+  local declared_checksum_file=""
+  local backup_basename=""
+  local calculated_checksum=""
+  local -a backup_output_lines=()
+  local -a checksum_lines=()
+
+  mapfile -t backup_output_lines <<< "$backup_output"
+  [[ "${#backup_output_lines[@]}" -eq 2 ]] ||
+    fail "PostgreSQL backup output must contain exactly the declared dump and checksum lines."
+  [[ "${backup_output_lines[0]}" == "Backup creado y validado: "* ]] ||
+    fail "PostgreSQL backup output did not declare the exact dump path."
+  [[ "${backup_output_lines[1]}" == "Checksum: "* ]] ||
+    fail "PostgreSQL backup output did not declare the exact checksum path."
+
+  postgres_backup_file="${backup_output_lines[0]#Backup creado y validado: }"
+  declared_checksum_file="${backup_output_lines[1]#Checksum: }"
+  [[ -n "$postgres_backup_file" &&
+    "$declared_checksum_file" == "$postgres_backup_file.sha256" ]] ||
+    fail "PostgreSQL backup output contains inconsistent paths."
+  [[ "$postgres_backup_file" == /* &&
+    "${postgres_backup_file%/*}" == "$backup_dir" ]] ||
+    fail "Declared PostgreSQL backup is outside the canonical backup directory."
+  backup_basename="${postgres_backup_file##*/}"
+  [[ "$backup_basename" =~ ^al_lio_[0-9]{8}T[0-9]{6}Z\.dump$ ]] ||
+    fail "Declared PostgreSQL backup filename is invalid."
+  [[ -f "$postgres_backup_file" && ! -L "$postgres_backup_file" &&
+    -s "$postgres_backup_file" ]] ||
+    fail "Declared PostgreSQL backup must be a non-empty regular file, not a symlink."
+  [[ "$(readlink -f -- "$postgres_backup_file")" == "$postgres_backup_file" ]] ||
+    fail "Declared PostgreSQL backup path is not canonical."
+  [[ -f "$declared_checksum_file" && ! -L "$declared_checksum_file" &&
+    -s "$declared_checksum_file" ]] ||
+    fail "Declared PostgreSQL checksum must be a non-empty regular file, not a symlink."
+  [[ "$(readlink -f -- "$declared_checksum_file")" == "$declared_checksum_file" ]] ||
+    fail "Declared PostgreSQL checksum path is not canonical."
+
+  calculated_checksum="$(sha256sum "$postgres_backup_file" | awk '{ print $1 }')"
+  [[ "$calculated_checksum" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "Declared PostgreSQL backup did not produce a valid SHA-256."
+  mapfile -t checksum_lines < "$declared_checksum_file"
+  [[ "${#checksum_lines[@]}" -eq 1 &&
+    "${checksum_lines[0]}" == "$calculated_checksum  $postgres_backup_file" ]] ||
+    fail "PostgreSQL checksum sidecar is not bound to the exact declared dump."
+  sha256sum --check "$declared_checksum_file" ||
+    fail "PostgreSQL checksum verification failed for the exact declared dump."
+  postgres_backup_checksum="$calculated_checksum"
+}
+
 write_release_record() {
   local outcome="$1"
   local staged_approvals="none"
@@ -277,7 +327,7 @@ release_short_sha="${release_sha:0:12}"
 [[ "$health_attempts" =~ ^[1-9][0-9]*$ ]] || fail "AL_LIO_HEALTH_ATTEMPTS must be a positive integer."
 [[ "$health_interval_seconds" =~ ^[1-9][0-9]*$ ]] || fail "AL_LIO_HEALTH_INTERVAL_SECONDS must be a positive integer."
 
-for command_name in git docker curl flock awk grep install readlink sha256sum tar mktemp od tr wc; do
+for command_name in git docker curl flock awk grep install readlink sha256sum tar mktemp od timeout tr wc; do
   require_command "$command_name"
 done
 
@@ -334,9 +384,9 @@ log "Fetching origin/main and validating the requested release"
 git -C "$repository_dir" fetch --tags origin main
 
 if [[ "$release_sha" == "$current_sha" ]]; then
-  curl -fsS "$base_url/api/health" >/dev/null
-  curl -fsS "$base_url/api/ready" >/dev/null
-  [[ "$(curl -fsS "$base_url/api/version")" == "{\"releaseSha\":\"$release_sha\"}" ]] ||
+  curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/health" >/dev/null
+  curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/ready" >/dev/null
+  [[ "$(curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/version")" == "{\"releaseSha\":\"$release_sha\"}" ]] ||
     fail "The public release identity does not match the running image."
   printf 'AL-LIO is already running %s and is healthy.\n' "$release_sha"
   exit 0
@@ -408,10 +458,12 @@ fi
 
 if [[ "$migration_required" -eq 1 ]]; then
   log "Creating and restore-testing the PostgreSQL backup"
-  AL_LIO_BACKUP_DIR="$backup_dir" bash "$release_dir/scripts/postgres/backup-production.sh"
-  postgres_backup_file="$(ls -1t "$backup_dir"/al_lio_*.dump | head -n 1)"
+  backup_output="$(
+    AL_LIO_BACKUP_DIR="$backup_dir" bash "$release_dir/scripts/postgres/backup-production.sh"
+  )"
+  printf '%s\n' "$backup_output"
+  validate_postgres_backup_output "$backup_output"
   bash "$release_dir/scripts/postgres/verify-backup-production.sh" "$postgres_backup_file"
-  postgres_backup_checksum="$(sha256sum "$postgres_backup_file" | awk '{ print $1 }')"
   restore_verification_result="passed"
 
   log "Rehearsing all pending migrations on an isolated restored database"
@@ -485,21 +537,21 @@ if ! wait_for_web_health; then
 fi
 
 [[ "$(docker inspect "$WEB_CONTAINER" --format '{{.Config.Image}}')" == "al-lio-web:$release_sha" ]] || fail "The running web image does not match the requested release."
-docker exec "$WEB_CONTAINER" wget -qO- http://127.0.0.1:3000/api/health >/dev/null
+timeout 20s docker exec "$WEB_CONTAINER" wget -T 5 -qO- http://127.0.0.1:3000/api/health >/dev/null
 internal_health_result="passed"
-docker exec "$WEB_CONTAINER" wget -qO- http://127.0.0.1:3000/api/ready >/dev/null
+timeout 20s docker exec "$WEB_CONTAINER" wget -T 5 -qO- http://127.0.0.1:3000/api/ready >/dev/null
 internal_readiness_result="passed"
-[[ "$(docker exec "$WEB_CONTAINER" wget -qO- http://127.0.0.1:3000/api/version)" == "{\"releaseSha\":\"$release_sha\"}" ]] ||
+[[ "$(timeout 20s docker exec "$WEB_CONTAINER" wget -T 5 -qO- http://127.0.0.1:3000/api/version)" == "{\"releaseSha\":\"$release_sha\"}" ]] ||
   fail "The internal release identity does not match the requested release."
 internal_version_result="$release_sha"
-curl -fsS "$base_url/api/health" >/dev/null
+curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/health" >/dev/null
 public_health_result="passed"
-curl -fsS "$base_url/api/ready" >/dev/null
+curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/ready" >/dev/null
 public_readiness_result="passed"
-[[ "$(curl -fsS "$base_url/api/version")" == "{\"releaseSha\":\"$release_sha\"}" ]] ||
+[[ "$(curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/version")" == "{\"releaseSha\":\"$release_sha\"}" ]] ||
   fail "The public release identity does not match the requested release."
 public_version_result="$release_sha"
-unauthenticated_radar_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/api/job-radar")"
+unauthenticated_radar_status="$(curl -sS --connect-timeout 5 --max-time 20 -o /dev/null -w '%{http_code}' "$base_url/api/job-radar")"
 [[ "$unauthenticated_radar_status" == "401" ]] || fail "Unauthenticated /api/job-radar returned HTTP $unauthenticated_radar_status instead of 401."
 automated_smoke_result="passed"
 
