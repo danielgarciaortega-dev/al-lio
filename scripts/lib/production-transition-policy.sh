@@ -17,6 +17,7 @@ production_transition_validated_approval_data=""
 readonly PRODUCTION_TRANSITION_COMPOSE_FILE="infra/docker-compose.prod.yml"
 readonly PRODUCTION_TRANSITION_APPROVALS_REPO_PATH="scripts/config/production-compose-env-removals.allowlist"
 readonly PRODUCTION_TRANSITION_APPROVAL_MAX_BYTES=65536
+readonly PRODUCTION_TRANSITION_GITATTRIBUTES_PATHSPEC=":(glob)**/.gitattributes"
 readonly -a PRODUCTION_TRANSITION_PROTECTED_CONTROL_PLANE=(
   ".dockerignore"
   ".github/workflows/ci.yml"
@@ -221,7 +222,8 @@ validate_production_transition() {
   production_transition_validated_approval_data=""
 
   protected_control_plane_changes="$(git -C "$repository" diff --name-only "$current_sha" "$candidate_sha" -- \
-    "${PRODUCTION_TRANSITION_PROTECTED_CONTROL_PLANE[@]}")"
+    "${PRODUCTION_TRANSITION_PROTECTED_CONTROL_PLANE[@]}" \
+    "$PRODUCTION_TRANSITION_GITATTRIBUTES_PATHSPEC")"
   if [[ -n "$protected_control_plane_changes" ]]; then
     production_transition_reject "This routine release changes the protected production control-plane: ${protected_control_plane_changes//$'\n'/, }. Follow docs/operations/DEPLOY_VPS.md as an explicitly reviewed exceptional transition." || return 1
   fi

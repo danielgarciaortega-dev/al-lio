@@ -48,6 +48,7 @@ async function createFixture({ composeContent = compose, approvalContent = "# no
   await write(root, "infra/Dockerfile", "FROM scratch\n");
   await write(root, "data/learning-competencies.json", "[]\n");
   await write(root, "scripts/import-learning-competencies.mjs", "export {};\n");
+  await write(root, ".gitattributes", "*.sh text eol=lf\n");
   await write(root, approvalPath, approvalContent);
   await write(root, "infra/postgres/migrations/0002_existing.sql", "CREATE TABLE existing_record (id bigint);\n");
   for (const path of [
@@ -156,6 +157,7 @@ test("the shared policy accepts a forward main transition with an additive migra
 
 for (const protectedPath of [
   ".dockerignore",
+  ".gitattributes",
   ".github/workflows/ci.yml",
   ".github/workflows/deploy-production.yml",
   "scripts/deploy-production.sh",
@@ -174,7 +176,13 @@ for (const protectedPath of [
   test(`the shared policy rejects protected control-plane change: ${protectedPath}`, async () => {
     await withFixture(async (fixture) => {
       const candidateSha = await commitCandidate(fixture, async (root) => {
-        await write(root, protectedPath, `candidate changed ${protectedPath}\n`);
+        await write(
+          root,
+          protectedPath,
+          protectedPath === ".gitattributes"
+            ? "*.sh text eol=crlf\n"
+            : `candidate changed ${protectedPath}\n`,
+        );
       });
       await assert.rejects(
         runPolicy(fixture, fixture.currentSha, candidateSha),
@@ -183,6 +191,35 @@ for (const protectedPath of [
     });
   });
 }
+
+for (const nestedAttributesPath of [
+  "scripts/.gitattributes",
+  "scripts/lib/.gitattributes",
+]) {
+  test(`the shared policy rejects adding nested attributes: ${nestedAttributesPath}`, async () => {
+    await withFixture(async (fixture) => {
+      const candidateSha = await commitCandidate(fixture, async (root) => {
+        await write(root, nestedAttributesPath, "*.sh text eol=crlf\n");
+      });
+      await assert.rejects(
+        runPolicy(fixture, fixture.currentSha, candidateSha),
+        /protected production control-plane/,
+      );
+    });
+  });
+}
+
+test("the shared policy rejects deleting root attributes", async () => {
+  await withFixture(async (fixture) => {
+    const candidateSha = await commitCandidate(fixture, async (root) => {
+      await rm(join(root, ".gitattributes"));
+    });
+    await assert.rejects(
+      runPolicy(fixture, fixture.currentSha, candidateSha),
+      /protected production control-plane/,
+    );
+  });
+});
 
 test("the protected control-plane rule permits an ordinary application change", async () => {
   await withFixture(async (fixture) => {

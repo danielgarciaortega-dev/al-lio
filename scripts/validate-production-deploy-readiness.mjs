@@ -39,9 +39,11 @@ const transitionPolicy = read("scripts/lib/production-transition-policy.sh");
 const composeRemovalApprovals = read("scripts/config/production-compose-env-removals.allowlist");
 const releaseEnvPreparer = read("scripts/prepare-release-env.sh");
 const releaseWorktreeIntegrity = read("scripts/lib/release-worktree-integrity.sh");
+const gitAttributes = read(".gitattributes");
 check("guarded production deploy script exists", existsSync(join(root, "scripts/deploy-production.sh")));
 check("deploy script requires an exact full SHA", deployScript.includes("^[0-9a-f]{40}$"));
 check("shared production transition policy exists", existsSync(join(root, "scripts/lib/production-transition-policy.sh")));
+check("shell scripts are committed with LF line endings", /^\*\.sh text eol=lf$/m.test(gitAttributes));
 check(
   "deploy script uses the shared current-to-candidate policy",
   deployScript.includes("lib/production-transition-policy.sh")
@@ -69,6 +71,8 @@ check(
     "infra/postgres/schema.sql",
     "infra/postgres/baseline.sha256",
   ].every((entry) => transitionPolicy.includes(`"${entry}"`))
+    && transitionPolicy.includes('PRODUCTION_TRANSITION_GITATTRIBUTES_PATHSPEC=":(glob)**/.gitattributes"')
+    && transitionPolicy.includes('"$PRODUCTION_TRANSITION_GITATTRIBUTES_PATHSPEC"')
     && transitionPolicy.includes("protected production control-plane"),
 );
 check(
