@@ -1,3 +1,8 @@
+// Source-level assertion rationale: the contract is the exact Git attribute,
+// index blob bytes, and executable mode committed for production shell scripts.
+// Git commands exercise those repository boundaries directly without running
+// production operations or depending on the checkout's platform line endings.
+
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";

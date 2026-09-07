@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const workflowUrl = new URL("../../../.github/workflows/deploy-production.yml", import.meta.url);
+const ciWorkflowUrl = new URL("../../../.github/workflows/ci.yml", import.meta.url);
 const entrypointUrl = new URL("../../../scripts/github-actions-deploy-entrypoint.sh", import.meta.url);
 
 test("production deployment waits for successful post-merge CI", async () => {
@@ -61,4 +62,16 @@ test("the forced SSH command exposes only the guarded deployment operation", asy
   assert.match(entrypoint, /\.\/scripts\/deploy-production\.sh "\$release_sha"/);
   assert.match(entrypoint, /"\$releases_dir"\/al-lio-\*/);
   assert.doesNotMatch(entrypoint, /\beval\b/);
+});
+
+test("CI pins ShellCheck 0.10.0 and checks every tracked shell script at default severity", async () => {
+  const workflow = await readFile(ciWorkflowUrl, "utf8");
+
+  assert.match(workflow, /SHELLCHECK_VERSION: "0\.10\.0"/);
+  assert.match(workflow, /SHELLCHECK_ARCHIVE_SHA256: "6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87"/);
+  assert.match(workflow, /sha256sum --check/);
+  assert.match(workflow, /git ls-files '\*\.sh'/);
+  assert.match(workflow, /"\$shellcheck_bin" -x "\$\{production_shell_scripts\[@\]\}"/);
+  assert.doesNotMatch(workflow, /shellcheck_bin.*--severity/);
+  assert.doesNotMatch(workflow, /curl[^\n]*\|\s*(?:ba)?sh/);
 });

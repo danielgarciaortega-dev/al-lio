@@ -97,6 +97,8 @@ approval_record_line() {
   local source_key="$2"
   local default_value="$3"
 
+  # The format must emit a literal Compose ${...} expression; printf arguments provide its reviewed fields.
+  # shellcheck disable=SC2016
   printf '      %s: ${%s:-%s}' "$key" "$source_key" "$default_value"
 }
 
@@ -280,6 +282,8 @@ validate_compose_env_transition() {
   declare -A current_environments=()
   declare -A candidate_environments=()
 
+  # Public diagnostic state is read by callers after this sourced function returns.
+  # shellcheck disable=SC2034
   compose_env_guard_error=""
   allowed_compose_env_mappings=()
   allowed_compose_env_lines=()

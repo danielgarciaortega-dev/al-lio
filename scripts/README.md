@@ -1,8 +1,9 @@
 # Scripts
 
-Operational Node and shell scripts. Every one is invoked through an `npm run`
-alias defined in `package.json` — run them that way, not directly, so the
-project root and env loading are consistent.
+Operational Node and shell scripts. Use the documented `npm run` alias when a
+table provides one so the project root and environment loading stay consistent.
+Scripts marked `—` are deliberate direct-entry operational tools: invoke them
+only from their documented VPS, release, migration, or runbook context.
 
 Import scripts need a reachable PostgreSQL (`DATABASE_URL` / migration URL).
 Validation scripts are static: they read repository files only and never

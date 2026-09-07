@@ -68,7 +68,8 @@ validate_managed_env_value() {
 readonly previous_env="$1"
 readonly release_env="$2"
 readonly release_sha="$3"
-readonly release_dir="$(dirname "$release_env")"
+release_dir="$(dirname "$release_env")"
+readonly release_dir
 
 [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || fail "Release SHA must be a full lowercase 40-character commit SHA."
 [[ -f "$previous_env" ]] || fail "Previous release environment file not found: $previous_env"

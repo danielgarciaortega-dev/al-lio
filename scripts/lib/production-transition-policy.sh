@@ -186,6 +186,8 @@ validate_production_transition() {
   local extra_path=""
   local migration_sql=""
 
+  # Public diagnostic state is read by callers after this sourced function returns.
+  # shellcheck disable=SC2034
   production_transition_error=""
   production_transition_allowed_compose_additions=()
   production_transition_allowed_compose_removals=()

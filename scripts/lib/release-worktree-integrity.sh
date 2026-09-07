@@ -46,6 +46,8 @@ validate_release_worktree_integrity() {
       return 1
     }
     git -C "$worktree" check-ignore -q -- .env || {
+      # Public diagnostic state is read by callers after this sourced function returns.
+      # shellcheck disable=SC2034
       release_worktree_integrity_error="Release .env is not ignored by the candidate Git tree: $worktree/.env"
       return 1
     }
