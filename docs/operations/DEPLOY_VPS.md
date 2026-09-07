@@ -38,9 +38,18 @@ umask 077
 export AL_LIO_REPOSITORY_DIR=/srv/danicode/projects/al-lio
 export AL_LIO_RELEASES_DIR=/srv/danicode/releases
 export AL_LIO_BACKUP_DIR=/srv/danicode/backups/al-lio
-export AL_LIO_RELEASE_SHA=<full-40-character-reviewed-main-sha>
-export AL_LIO_EXCEPTION_REASON=<reviewed-ticket-or-change-reference>
+export AL_LIO_RELEASE_SHA="REPLACE_WITH_FULL_40_CHARACTER_REVIEWED_MAIN_SHA"
+export AL_LIO_EXCEPTION_REASON="REPLACE_WITH_REVIEWED_TICKET_OR_CHANGE_REFERENCE"
 
+for AL_LIO_REQUIRED_VALUE_NAME in AL_LIO_RELEASE_SHA AL_LIO_EXCEPTION_REASON; do
+  AL_LIO_REQUIRED_VALUE="${!AL_LIO_REQUIRED_VALUE_NAME:-}"
+  if [[ -z "$AL_LIO_REQUIRED_VALUE" || "$AL_LIO_REQUIRED_VALUE" == REPLACE_WITH_* ]]; then
+    printf 'ERROR: replace the placeholder for %s before continuing.\n' \
+      "$AL_LIO_REQUIRED_VALUE_NAME" >&2
+    exit 1
+  fi
+done
+unset AL_LIO_REQUIRED_VALUE_NAME AL_LIO_REQUIRED_VALUE
 [[ "$AL_LIO_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
 [[ -n "$AL_LIO_EXCEPTION_REASON" ]]
 [[ "$(id -u)" -ne 0 ]]
@@ -59,7 +68,7 @@ read_env_value() {
   line="$(grep -E "^${key}=" "$env_file" | tail -n 1 || true)"
   [[ -n "$line" ]] || return 1
   value="${line#*=}"
-  value="${value%$'\\r'}"
+  value="${value%$'\r'}"
   if [[ "$value" == \"*\" && "$value" == *\" ]]; then
     value="${value:1:${#value}-2}"
   elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
@@ -170,10 +179,258 @@ git -C "$AL_LIO_REPOSITORY_DIR" diff "$AL_LIO_CURRENT_SHA" "$AL_LIO_RELEASE_SHA"
   infra/docker-compose.prod.yml infra/Dockerfile infra/postgres/migrations
 ```
 
-For the historical `dc6607e` transition, missing current-release approval data
-and the six deliberate environment mapping removals remain an expected manual
-exception. Do not add approvals after the removal has happened. Review each
-exact removed service, destination key, source variable and default.
+### 3.1 Fail-closed checklist for the historical production release
+
+The transition from `dc6607ec88810d90e43d415e6781bc90e1c6612f` is the only
+historical exception covered by this block. It permits exactly six retired web
+environment mappings, introduces the immutable release identity, adds
+`/api/version`, and adds migration `0017_job_radar_sync_state.sql`. It does not
+create a reusable removal approval. A reviewer must calculate and provide the
+expected runtime/control-plane digest from the exact candidate; a mismatch
+means the reviewed diff changed and this procedure stops.
+
+```bash
+export AL_LIO_HISTORICAL_SOURCE_SHA="dc6607ec88810d90e43d415e6781bc90e1c6612f"
+export AL_LIO_REVIEWED_RUNTIME_CONTROL_PLANE_DIFF_SHA256="REPLACE_WITH_REVIEWED_64_CHARACTER_LOWERCASE_SHA256"
+
+if [[ "$AL_LIO_CURRENT_SHA" != "$AL_LIO_HISTORICAL_SOURCE_SHA" ]]; then
+  printf 'ERROR: this checklist applies only to the reviewed historical release.\n' >&2
+  exit 1
+fi
+if [[ "$AL_LIO_REVIEWED_RUNTIME_CONTROL_PLANE_DIFF_SHA256" == REPLACE_WITH_* ]] ||
+  [[ ! "$AL_LIO_REVIEWED_RUNTIME_CONTROL_PLANE_DIFF_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  printf 'ERROR: provide the independently reviewed runtime/control-plane diff SHA-256.\n' >&2
+  exit 1
+fi
+
+AL_LIO_EXPECTED_HISTORICAL_COMPOSE_REMOVALS="$(LC_ALL=C sort <<'EOF'
+ADZUNA_APP_ID: ${ADZUNA_APP_ID:-}
+ADZUNA_APP_KEY: ${ADZUNA_APP_KEY:-}
+AL_LIO_DEMO_ACCESS_ENABLED: ${AL_LIO_DEMO_ACCESS_ENABLED:-false}
+INFOJOBS_CLIENT_ID: ${INFOJOBS_CLIENT_ID:-}
+INFOJOBS_CLIENT_SECRET: ${INFOJOBS_CLIENT_SECRET:-}
+JOOBLE_API_KEY: ${JOOBLE_API_KEY:-}
+EOF
+)"
+AL_LIO_EXPECTED_HISTORICAL_COMPOSE_ADDITIONS='AL_LIO_RELEASE_SHA: ${AL_LIO_RELEASE_SHA:?AL_LIO_RELEASE_SHA is injected by the release mechanism}'
+AL_LIO_HISTORICAL_COMPOSE_NUMSTAT="$(
+  git -C "$AL_LIO_REPOSITORY_DIR" diff --numstat \
+    "$AL_LIO_HISTORICAL_SOURCE_SHA" "$AL_LIO_RELEASE_SHA" -- \
+    infra/docker-compose.prod.yml
+)"
+[[ "$AL_LIO_HISTORICAL_COMPOSE_NUMSTAT" == $'1\t6\tinfra/docker-compose.prod.yml' ]] || {
+  printf 'ERROR: unexpected historical Compose line counts; stop for manual review.\n' >&2
+  exit 1
+}
+AL_LIO_ACTUAL_HISTORICAL_COMPOSE_REMOVALS="$(
+  git -C "$AL_LIO_REPOSITORY_DIR" diff --unified=0 --no-color \
+    "$AL_LIO_HISTORICAL_SOURCE_SHA" "$AL_LIO_RELEASE_SHA" -- \
+    infra/docker-compose.prod.yml |
+    sed -n '/^--- /d; /^-/ { s/^-[[:space:]]*//; p; }' |
+    LC_ALL=C sort
+)"
+AL_LIO_ACTUAL_HISTORICAL_COMPOSE_ADDITIONS="$(
+  git -C "$AL_LIO_REPOSITORY_DIR" diff --unified=0 --no-color \
+    "$AL_LIO_HISTORICAL_SOURCE_SHA" "$AL_LIO_RELEASE_SHA" -- \
+    infra/docker-compose.prod.yml |
+    sed -n '/^+++ /d; /^+/ { s/^+[[:space:]]*//; p; }'
+)"
+[[ "$AL_LIO_ACTUAL_HISTORICAL_COMPOSE_REMOVALS" == \
+  "$AL_LIO_EXPECTED_HISTORICAL_COMPOSE_REMOVALS" ]] || {
+  printf 'ERROR: historical Compose removals differ from the six reviewed mappings.\n' >&2
+  exit 1
+}
+[[ "$AL_LIO_ACTUAL_HISTORICAL_COMPOSE_ADDITIONS" == \
+  "$AL_LIO_EXPECTED_HISTORICAL_COMPOSE_ADDITIONS" ]] || {
+  printf 'ERROR: historical Compose additions differ from AL_LIO_RELEASE_SHA.\n' >&2
+  exit 1
+}
+
+validate_historical_regular_blob() {
+  local path="$1" label="$2" output_variable="$3"
+  local tree_entry="" mode="" type="" object="" listed_path=""
+
+  tree_entry="$(git -C "$AL_LIO_REPOSITORY_DIR" ls-tree \
+    "$AL_LIO_RELEASE_SHA" -- "$path")"
+  IFS=$' \t' read -r mode type object listed_path <<< "$tree_entry"
+  if [[ "$mode" != 100644 || "$type" != blob || -z "$object" ||
+    "$listed_path" != "$path" ]]; then
+    printf 'ERROR: %s must be one exact 100644 blob; found mode=%s type=%s.\n' \
+      "$label" "${mode:-missing}" "${type:-missing}" >&2
+    return 1
+  fi
+  printf -v "$output_variable" '%s' "$object"
+}
+
+AL_LIO_VERSION_ROUTE_OBJECT=""
+AL_LIO_MIGRATION_0017_OBJECT=""
+validate_historical_regular_blob \
+  src/app/api/version/route.ts \
+  "Candidate /api/version route" \
+  AL_LIO_VERSION_ROUTE_OBJECT || exit 1
+validate_historical_regular_blob \
+  infra/postgres/migrations/0017_job_radar_sync_state.sql \
+  "Candidate migration 0017" \
+  AL_LIO_MIGRATION_0017_OBJECT || exit 1
+
+[[ "$(git -C "$AL_LIO_REPOSITORY_DIR" diff --name-status \
+  "$AL_LIO_HISTORICAL_SOURCE_SHA" "$AL_LIO_RELEASE_SHA" -- \
+  src/app/api/version/route.ts)" == $'A\tsrc/app/api/version/route.ts' ]] || {
+  printf 'ERROR: /api/version is not the exact reviewed new route.\n' >&2
+  exit 1
+}
+git -C "$AL_LIO_REPOSITORY_DIR" cat-file blob "$AL_LIO_VERSION_ROUTE_OBJECT" |
+  grep -Fq 'process.env.AL_LIO_RELEASE_SHA' || {
+    printf 'ERROR: /api/version does not expose the immutable release identity.\n' >&2
+    exit 1
+  }
+
+[[ "$(git -C "$AL_LIO_REPOSITORY_DIR" diff --name-status \
+  "$AL_LIO_HISTORICAL_SOURCE_SHA" "$AL_LIO_RELEASE_SHA" -- \
+  infra/postgres/migrations)" == \
+  $'A\tinfra/postgres/migrations/0017_job_radar_sync_state.sql' ]] || {
+  printf 'ERROR: migration changes differ from the reviewed 0017 migration.\n' >&2
+  exit 1
+}
+AL_LIO_HISTORICAL_MIGRATION_SQL="$(
+  git -C "$AL_LIO_REPOSITORY_DIR" cat-file blob "$AL_LIO_MIGRATION_0017_OBJECT"
+)"
+if grep -Eiq '(^|[^[:alnum:]_])(drop[[:space:]]+(table|schema|column|index)|truncate[[:space:]]+table|delete[[:space:]]+from|alter[[:space:]]+table[^;]*(drop[[:space:]]+column|alter[[:space:]]+column|rename[[:space:]]))([^[:alnum:]_]|$)' \
+  <<< "$AL_LIO_HISTORICAL_MIGRATION_SQL"; then
+  printf 'ERROR: migration 0017 contains a destructive or structural statement.\n' >&2
+  exit 1
+fi
+
+AL_LIO_ACTUAL_RUNTIME_CONTROL_PLANE_DIFF_SHA256="$(
+  {
+    printf 'source_sha=%s\n' "$AL_LIO_HISTORICAL_SOURCE_SHA"
+    printf 'candidate_sha=%s\n' "$AL_LIO_RELEASE_SHA"
+    git -C "$AL_LIO_REPOSITORY_DIR" diff --raw --no-abbrev \
+      "$AL_LIO_HISTORICAL_SOURCE_SHA" "$AL_LIO_RELEASE_SHA" -- \
+      .dockerignore ':(glob)**/.gitattributes' \
+      .github/workflows/ci.yml .github/workflows/deploy-production.yml \
+      infra/Dockerfile data/learning-competencies.json \
+      scripts/import-learning-competencies.mjs scripts/deploy-production.sh \
+      scripts/github-actions-deploy-entrypoint.sh \
+      scripts/lib/production-transition-policy.sh scripts/lib/compose-env-guard.sh \
+      scripts/lib/release-worktree-integrity.sh scripts/prepare-release-env.sh \
+      scripts/validate-production-transition.sh \
+      scripts/validate-production-deploy-readiness.mjs \
+      scripts/config/production-compose-env-removals.allowlist scripts/postgres \
+      src/app/api/version/route.ts \
+      infra/postgres/migrations/0017_job_radar_sync_state.sql \
+      infra/postgres/schema.sql infra/postgres/baseline.sha256
+  } | sha256sum | awk '{ print $1 }'
+)"
+[[ "$AL_LIO_ACTUAL_RUNTIME_CONTROL_PLANE_DIFF_SHA256" == \
+  "$AL_LIO_REVIEWED_RUNTIME_CONTROL_PLANE_DIFF_SHA256" ]] || {
+  printf 'ERROR: runtime/control-plane diff changed; stop for manual review.\n' >&2
+  exit 1
+}
+
+# The reviewed digest above binds these validators to the exact candidate. Load
+# those Git blobs from a private temporary directory only after that check, then
+# reuse the production raw-byte loader and canonical approval parser.
+AL_LIO_COMPOSE_GUARD_OBJECT=""
+AL_LIO_TRANSITION_POLICY_OBJECT=""
+validate_historical_regular_blob \
+  scripts/lib/compose-env-guard.sh \
+  "Candidate Compose environment guard" \
+  AL_LIO_COMPOSE_GUARD_OBJECT || exit 1
+validate_historical_regular_blob \
+  scripts/lib/production-transition-policy.sh \
+  "Candidate production transition policy" \
+  AL_LIO_TRANSITION_POLICY_OBJECT || exit 1
+
+cleanup_historical_validator_dir() {
+  if ! rm -rf -- "$AL_LIO_HISTORICAL_VALIDATOR_DIR"; then
+    printf 'ERROR: private historical validator directory could not be removed.\n' >&2
+    return 1
+  fi
+}
+
+AL_LIO_HISTORICAL_VALIDATOR_DIR="$(
+  mktemp -d "${TMPDIR:-/tmp}/al-lio-historical-validator.XXXXXX"
+)"
+if ! chmod 700 "$AL_LIO_HISTORICAL_VALIDATOR_DIR" ||
+  ! git -C "$AL_LIO_REPOSITORY_DIR" cat-file blob \
+    "$AL_LIO_COMPOSE_GUARD_OBJECT" > \
+    "$AL_LIO_HISTORICAL_VALIDATOR_DIR/compose-env-guard.sh" ||
+  ! git -C "$AL_LIO_REPOSITORY_DIR" cat-file blob \
+    "$AL_LIO_TRANSITION_POLICY_OBJECT" > \
+    "$AL_LIO_HISTORICAL_VALIDATOR_DIR/production-transition-policy.sh" ||
+  ! chmod 600 "$AL_LIO_HISTORICAL_VALIDATOR_DIR/compose-env-guard.sh" \
+    "$AL_LIO_HISTORICAL_VALIDATOR_DIR/production-transition-policy.sh"; then
+  cleanup_historical_validator_dir || exit 1
+  printf 'ERROR: exact candidate approval validators could not be prepared.\n' >&2
+  exit 1
+fi
+
+if ! (
+  if ! source "$AL_LIO_HISTORICAL_VALIDATOR_DIR/production-transition-policy.sh"; then
+    printf 'ERROR: exact candidate production transition policy could not be loaded.\n' >&2
+    exit 1
+  fi
+  if ! validate_regular_git_blob \
+    "$AL_LIO_REPOSITORY_DIR" \
+    "$AL_LIO_RELEASE_SHA" \
+    "scripts/config/production-compose-env-removals.allowlist" \
+    "Candidate Compose removal approval file"; then
+    printf 'ERROR: %s\n' "$production_transition_error" >&2
+    exit 1
+  fi
+  AL_LIO_CANDIDATE_APPROVAL_OBJECT="$production_transition_validated_blob_object"
+  production_transition_validated_blob_object=""
+  if ! validate_and_load_approval_blob \
+    "$AL_LIO_REPOSITORY_DIR" \
+    "$AL_LIO_CANDIDATE_APPROVAL_OBJECT" \
+    "Candidate Compose removal approval file"; then
+    printf 'ERROR: %s\n' "$production_transition_error" >&2
+    exit 1
+  fi
+  AL_LIO_CANDIDATE_COMPOSE_REMOVAL_APPROVALS="$production_transition_validated_approval_data"
+  production_transition_validated_approval_data=""
+  if ! AL_LIO_CANDIDATE_WEB_ENVIRONMENT="$(extract_service_environment \
+    "$AL_LIO_REPOSITORY_DIR" "$AL_LIO_RELEASE_SHA" \
+    infra/docker-compose.prod.yml al_lio_web)"; then
+    printf 'ERROR: candidate al_lio_web environment could not be inspected.\n' >&2
+    exit 1
+  fi
+  if ! AL_LIO_CANDIDATE_RADAR_ENVIRONMENT="$(extract_service_environment \
+    "$AL_LIO_REPOSITORY_DIR" "$AL_LIO_RELEASE_SHA" \
+    infra/docker-compose.prod.yml al_lio_radar)"; then
+    printf 'ERROR: candidate al_lio_radar environment could not be inspected.\n' >&2
+    exit 1
+  fi
+  if ! validate_removal_approval_data \
+    "$AL_LIO_CANDIDATE_COMPOSE_REMOVAL_APPROVALS" \
+    "$AL_LIO_CANDIDATE_WEB_ENVIRONMENT" \
+    "$AL_LIO_CANDIDATE_RADAR_ENVIRONMENT" \
+    "Candidate"; then
+    printf 'ERROR: %s\n' "$compose_env_guard_error" >&2
+    exit 1
+  fi
+
+  while IFS= read -r AL_LIO_APPROVAL_RECORD || [[ -n "$AL_LIO_APPROVAL_RECORD" ]]; do
+    [[ -z "$AL_LIO_APPROVAL_RECORD" || "$AL_LIO_APPROVAL_RECORD" == \#* ]] && continue
+    printf 'ERROR: historical candidate must contain zero active Compose removal approvals.\n' >&2
+    exit 1
+  done <<< "$AL_LIO_CANDIDATE_COMPOSE_REMOVAL_APPROVALS"
+); then
+  cleanup_historical_validator_dir || exit 1
+  exit 1
+fi
+cleanup_historical_validator_dir || exit 1
+unset AL_LIO_HISTORICAL_VALIDATOR_DIR AL_LIO_COMPOSE_GUARD_OBJECT \
+  AL_LIO_TRANSITION_POLICY_OBJECT AL_LIO_VERSION_ROUTE_OBJECT \
+  AL_LIO_MIGRATION_0017_OBJECT
+unset -f validate_historical_regular_blob cleanup_historical_validator_dir
+```
+
+Do not add the six retired variables to
+`scripts/config/production-compose-env-removals.allowlist`. Continue only when
+the exact Compose, route, migration and reviewed runtime/control-plane checks
+above all pass. Any other relevant difference is a hard stop for manual review.
 
 ## 4. Create the immutable candidate
 
@@ -595,7 +852,11 @@ damaged state, and stop both writers. This is never routine application
 rollback.
 
 ```bash
-export AL_LIO_RECOVERY_BACKUP=<exact-verified-dump-from-release-record>
+export AL_LIO_RECOVERY_BACKUP="REPLACE_WITH_EXACT_VERIFIED_DUMP_FROM_RELEASE_RECORD"
+if [[ "$AL_LIO_RECOVERY_BACKUP" == REPLACE_WITH_* ]]; then
+  printf 'ERROR: select the exact verified dump from the release record.\n' >&2
+  exit 1
+fi
 [[ -s "$AL_LIO_RECOVERY_BACKUP" ]]
 [[ -s "$AL_LIO_RECOVERY_BACKUP.sha256" ]]
 sha256sum --check "$AL_LIO_RECOVERY_BACKUP.sha256"
