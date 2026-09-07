@@ -51,9 +51,19 @@ for AL_LIO_REQUIRED_VALUE_NAME in AL_LIO_RELEASE_SHA AL_LIO_EXCEPTION_REASON; do
 done
 unset AL_LIO_REQUIRED_VALUE_NAME AL_LIO_REQUIRED_VALUE
 [[ "$AL_LIO_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
-[[ -n "$AL_LIO_EXCEPTION_REASON" ]]
+if [[ "${#AL_LIO_EXCEPTION_REASON}" -gt 256 ||
+  "$AL_LIO_EXCEPTION_REASON" == *$'\n'* ||
+  "$AL_LIO_EXCEPTION_REASON" == *$'\r'* ]] ||
+  ! LC_ALL=C grep -Eq '^[ -~]+$' <<< "$AL_LIO_EXCEPTION_REASON"; then
+  printf 'ERROR: AL_LIO_EXCEPTION_REASON must be 1-256 printable ASCII bytes on one line.\n' >&2
+  exit 1
+fi
 [[ "$(id -u)" -ne 0 ]]
 mkdir -p -- "$AL_LIO_RELEASES_DIR" "$AL_LIO_BACKUP_DIR"
+command -v timeout >/dev/null || {
+  printf 'ERROR: GNU timeout is required for bounded container HTTP probes.\n' >&2
+  exit 1
+}
 exec 9>"$AL_LIO_BACKUP_DIR/deploy-production.lock"
 flock -n 9
 ```
@@ -92,24 +102,71 @@ wait_for_web_health() {
 AL_LIO_REHEARSAL_DB=""
 AL_LIO_RADAR_STOPPED=0
 AL_LIO_CUTOVER_STARTED=0
+AL_LIO_RUNTIME_RECOVERY_LOG="$AL_LIO_BACKUP_DIR/runtime-recovery-${AL_LIO_RELEASE_SHA:0:12}.log"
+
+record_runtime_recovery_event() {
+  local result="$1" detail="$2"
+  if ! printf \
+    'timestamp_utc=%s result=%s detail=%s\ndb_backup_path=%s\ndb_backup_checksum=%s\nlearning_import_result=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$result" "$detail" \
+    "${AL_LIO_POSTGRES_BACKUP:-not-created}" \
+    "${AL_LIO_POSTGRES_BACKUP_CHECKSUM:-not-created}" \
+    "${AL_LIO_LEARNING_IMPORT_RESULT:-not-started}" >> \
+    "$AL_LIO_RUNTIME_RECOVERY_LOG"; then
+    printf 'CRITICAL: runtime recovery evidence could not be written to %s.\n' \
+      "$AL_LIO_RUNTIME_RECOVERY_LOG" >&2
+    return 1
+  fi
+  if ! chmod 600 "$AL_LIO_RUNTIME_RECOVERY_LOG"; then
+    printf 'CRITICAL: runtime recovery evidence could not be secured at %s.\n' \
+      "$AL_LIO_RUNTIME_RECOVERY_LOG" >&2
+    return 1
+  fi
+}
 
 cleanup_manual_release() {
   local status=$?
+  local recovery_failed=0
   trap - EXIT INT TERM
   if [[ -n "$AL_LIO_REHEARSAL_DB" ]]; then
-    docker exec al_lio_postgres dropdb -U al_lio --if-exists \
-      "$AL_LIO_REHEARSAL_DB" >/dev/null 2>&1 || true
+    if ! docker exec al_lio_postgres dropdb -U al_lio --if-exists \
+      "$AL_LIO_REHEARSAL_DB" >/dev/null 2>&1; then
+      printf 'WARNING: temporary rehearsal database cleanup failed: %s.\n' \
+        "$AL_LIO_REHEARSAL_DB" >&2
+    fi
   fi
   if [[ "$status" -ne 0 && "$AL_LIO_CUTOVER_STARTED" -eq 1 ]]; then
-    (
+    printf 'ERROR: deployment failed after cutover; restoring the previous web release.\n' >&2
+    if ! (
       cd "$AL_LIO_PREVIOUS_RELEASE_DIR"
       docker compose -f infra/docker-compose.prod.yml --env-file .env \
         up -d --no-deps al_lio_web </dev/null
-    ) || true
-    wait_for_web_health || true
+    ); then
+      printf 'CRITICAL: automatic web rollback command failed. Production requires operator recovery.\n' >&2
+      record_runtime_recovery_event failed automatic-web-rollback-command || recovery_failed=1
+      recovery_failed=1
+    elif ! wait_for_web_health; then
+      printf 'CRITICAL: previous web release did not become healthy after automatic rollback.\n' >&2
+      record_runtime_recovery_event failed automatic-web-rollback-health || recovery_failed=1
+      recovery_failed=1
+    else
+      record_runtime_recovery_event restored automatic-web-rollback || recovery_failed=1
+    fi
   fi
   if [[ "$AL_LIO_RADAR_STOPPED" -eq 1 ]]; then
-    docker start al_lio_radar >/dev/null || true
+    if ! docker start al_lio_radar >/dev/null ||
+      [[ "$(docker inspect al_lio_radar --format '{{.State.Status}}' 2>/dev/null)" != running ]]; then
+      printf 'CRITICAL: automatic Radar restart failed. Production requires operator recovery.\n' >&2
+      record_runtime_recovery_event failed automatic-radar-restart || recovery_failed=1
+      recovery_failed=1
+    else
+      record_runtime_recovery_event restored automatic-radar-restart || recovery_failed=1
+    fi
+  fi
+  if [[ "$recovery_failed" -ne 0 ]]; then
+    printf 'CRITICAL: automatic runtime recovery is incomplete; evidence: %s\n' \
+      "$AL_LIO_RUNTIME_RECOVERY_LOG" >&2
+    status=1
   fi
   exit "$status"
 }
@@ -517,6 +574,9 @@ AL_LIO_RADAR_BACKUP=not-required
 AL_LIO_RADAR_BACKUP_STATUS=not-required
 AL_LIO_PENDING_MIGRATION_IDS=none
 AL_LIO_APPLIED_MIGRATION_IDS=none
+AL_LIO_LEARNING_IMPORT_REQUIRED=0
+AL_LIO_LEARNING_IMPORT_RESULT=not-started
+AL_LIO_DB_MUTATION_REQUIRED=0
 if grep -q 'PENDIENTE' <<< "$AL_LIO_MIGRATION_STATUS"; then
   AL_LIO_MIGRATION_REQUIRED=1
   AL_LIO_PENDING_MIGRATION_IDS="$(
@@ -525,25 +585,55 @@ if grep -q 'PENDIENTE' <<< "$AL_LIO_MIGRATION_STATUS"; then
   )"
   [[ -n "$AL_LIO_PENDING_MIGRATION_IDS" ]]
 fi
+
+if git -C "$AL_LIO_REPOSITORY_DIR" diff --quiet \
+  "$AL_LIO_CURRENT_SHA" "$AL_LIO_RELEASE_SHA" -- \
+  data/learning-competencies.json; then
+  AL_LIO_LEARNING_IMPORT_REQUIRED=0
+  AL_LIO_LEARNING_IMPORT_RESULT=skipped
+else
+  AL_LIO_LEARNING_DIFF_STATUS=$?
+  [[ "$AL_LIO_LEARNING_DIFF_STATUS" -eq 1 ]] || {
+    printf 'ERROR: unable to determine whether the learning catalogue changed.\n' >&2
+    exit 1
+  }
+  AL_LIO_LEARNING_IMPORT_REQUIRED=1
+fi
+unset AL_LIO_LEARNING_DIFF_STATUS
+
+if [[ "$AL_LIO_MIGRATION_REQUIRED" -eq 1 ||
+  "$AL_LIO_LEARNING_IMPORT_REQUIRED" -eq 1 ]]; then
+  AL_LIO_DB_MUTATION_REQUIRED=1
+fi
 ```
 
-When migrations are pending, create a custom-format dump and run the full
-restore test before rehearsal.
+Before any migration or catalogue import can mutate PostgreSQL, create a
+custom-format dump and run the full restore test. Migration rehearsal remains
+conditional only on pending migrations.
 
 ```bash
-if [[ "$AL_LIO_MIGRATION_REQUIRED" -eq 1 ]]; then
+if [[ "$AL_LIO_DB_MUTATION_REQUIRED" -eq 1 ]]; then
   AL_LIO_BACKUP_OUTPUT="$(
     AL_LIO_BACKUP_DIR="$AL_LIO_BACKUP_DIR" \
       bash scripts/postgres/backup-production.sh
   )"
   printf '%s\n' "$AL_LIO_BACKUP_OUTPUT"
-  AL_LIO_POSTGRES_BACKUP="$(
-    sed -n 's/^Backup creado y validado: //p' <<< "$AL_LIO_BACKUP_OUTPUT" | tail -n 1
-  )"
-  [[ -n "$AL_LIO_POSTGRES_BACKUP" && -s "$AL_LIO_POSTGRES_BACKUP" ]]
-  [[ -s "$AL_LIO_POSTGRES_BACKUP.sha256" ]]
-  sha256sum --check "$AL_LIO_POSTGRES_BACKUP.sha256"
+  mapfile -t AL_LIO_BACKUP_PATHS < <(
+    sed -n 's/^Backup creado y validado: //p' <<< "$AL_LIO_BACKUP_OUTPUT"
+  )
+  [[ "${#AL_LIO_BACKUP_PATHS[@]}" -eq 1 ]]
+  AL_LIO_POSTGRES_BACKUP="${AL_LIO_BACKUP_PATHS[0]}"
+  unset AL_LIO_BACKUP_PATHS
+  [[ "$AL_LIO_POSTGRES_BACKUP" == "$AL_LIO_BACKUP_DIR"/*.dump ]]
+  [[ -f "$AL_LIO_POSTGRES_BACKUP" && ! -L "$AL_LIO_POSTGRES_BACKUP" &&
+    -s "$AL_LIO_POSTGRES_BACKUP" ]]
+  [[ "$(readlink -f -- "$AL_LIO_POSTGRES_BACKUP")" == "$AL_LIO_POSTGRES_BACKUP" ]]
+  [[ -f "$AL_LIO_POSTGRES_BACKUP.sha256" && ! -L "$AL_LIO_POSTGRES_BACKUP.sha256" ]]
   AL_LIO_POSTGRES_BACKUP_CHECKSUM="$(sha256sum "$AL_LIO_POSTGRES_BACKUP" | awk '{ print $1 }')"
+  [[ "$AL_LIO_POSTGRES_BACKUP_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$(cat -- "$AL_LIO_POSTGRES_BACKUP.sha256")" == \
+    "$AL_LIO_POSTGRES_BACKUP_CHECKSUM  $AL_LIO_POSTGRES_BACKUP" ]]
+  sha256sum --check "$AL_LIO_POSTGRES_BACKUP.sha256"
   bash scripts/postgres/verify-backup-production.sh "$AL_LIO_POSTGRES_BACKUP"
   AL_LIO_RESTORE_VERIFICATION=passed
 fi
@@ -593,6 +683,54 @@ fi
 The additional one in the expected count is the audited `0001` baseline in
 `infra/postgres/schema.sql`; versioned files start at `0002`.
 
+Create the private attempt record before the first possible production data or
+runtime mutation. Every update replaces the record atomically and keeps the
+same strict `key=value` format consumed by delayed recovery.
+
+```bash
+export AL_LIO_ATTEMPT_RECORD="$AL_LIO_BACKUP_DIR/release-$AL_LIO_RELEASE_STARTED_AT-${AL_LIO_RELEASE_SHA:0:12}-attempt.txt"
+export AL_LIO_RELEASE_RECORD="$AL_LIO_ATTEMPT_RECORD"
+AL_LIO_ATTEMPT_OUTCOME=prepared
+
+write_attempt_recovery_record() {
+  local temporary_record
+  temporary_record="$(mktemp "$AL_LIO_BACKUP_DIR/.attempt-record.XXXXXX")" || return 1
+  if ! chmod 600 "$temporary_record"; then
+    rm -f -- "$temporary_record" || true
+    return 1
+  fi
+  if ! printf '%s\n' \
+    "outcome=$AL_LIO_ATTEMPT_OUTCOME" \
+    "timestamp_utc=$AL_LIO_RELEASE_STARTED_AT" \
+    "current_sha=$AL_LIO_CURRENT_SHA" \
+    "candidate_sha=$AL_LIO_RELEASE_SHA" \
+    "previous_release_path=$AL_LIO_PREVIOUS_RELEASE_DIR" \
+    "candidate_release_path=$AL_LIO_RELEASE_DIR" \
+    "base_url=$AL_LIO_BASE_URL" \
+    "previous_image=$AL_LIO_CURRENT_IMAGE" \
+    "candidate_image=al-lio-web:$AL_LIO_RELEASE_SHA" \
+    "postgres_container_id=$AL_LIO_POSTGRES_ID" \
+    "radar_container_id=$AL_LIO_RADAR_ID" \
+    "db_backup_path=$AL_LIO_POSTGRES_BACKUP" \
+    "db_backup_checksum=$AL_LIO_POSTGRES_BACKUP_CHECKSUM" \
+    "learning_import_result=$AL_LIO_LEARNING_IMPORT_RESULT" > "$temporary_record"; then
+    rm -f -- "$temporary_record" || true
+    return 1
+  fi
+  if ! mv -f -- "$temporary_record" "$AL_LIO_ATTEMPT_RECORD"; then
+    rm -f -- "$temporary_record" || true
+    return 1
+  fi
+  [[ -f "$AL_LIO_ATTEMPT_RECORD" && ! -L "$AL_LIO_ATTEMPT_RECORD" &&
+    "$(stat -c '%a' "$AL_LIO_ATTEMPT_RECORD")" == 600 ]]
+}
+
+write_attempt_recovery_record || {
+  printf 'CRITICAL: private attempt recovery record could not be created.\n' >&2
+  exit 1
+}
+```
+
 ## 8. Back up Radar and apply rehearsed migrations
 
 When migrations are required, stop the existing Radar writer, archive its
@@ -631,16 +769,28 @@ if [[ "$AL_LIO_MIGRATION_REQUIRED" -eq 1 ]]; then
   )"
   [[ "$AL_LIO_PRODUCTION_MIGRATION_COUNT" == "$AL_LIO_EXPECTED_MIGRATION_COUNT" ]]
   AL_LIO_APPLIED_MIGRATION_IDS="$AL_LIO_PENDING_MIGRATION_IDS"
+  AL_LIO_ATTEMPT_OUTCOME=migrations-applied
+  write_attempt_recovery_record
 fi
 ```
 
-If the reviewed release changes `data/learning-competencies.json`, run its
-operator-managed import only after migrations pass; otherwise skip it.
+If the reviewed release changes `data/learning-competencies.json`, the earlier
+diff gate requires a verified PostgreSQL recovery point before running its
+operator-managed import exactly once. Otherwise emit an explicit skip result.
 
 ```bash
-docker compose -f infra/docker-compose.prod.yml --env-file .env \
-  --profile ops run --rm -T al_lio_migrator \
-  node scripts/import-learning-competencies.mjs
+if [[ "$AL_LIO_LEARNING_IMPORT_REQUIRED" -eq 0 ]]; then
+  AL_LIO_LEARNING_IMPORT_RESULT=skipped
+  printf 'SKIP: learning catalogue data is unchanged.\n'
+else
+  docker compose -f infra/docker-compose.prod.yml --env-file .env \
+    --profile ops run --rm -T al_lio_migrator \
+    node scripts/import-learning-competencies.mjs
+  AL_LIO_LEARNING_IMPORT_RESULT=completed
+  AL_LIO_ATTEMPT_OUTCOME=learning-import-completed
+  write_attempt_recovery_record
+  printf 'Learning catalogue import completed exactly once.\n'
+fi
 ```
 
 ## 9. Cut over only web and prove the release
@@ -652,15 +802,20 @@ validate_release_worktree_integrity "$AL_LIO_RELEASE_DIR" "$AL_LIO_RELEASE_SHA" 
   printf 'ERROR: %s\n' "$release_worktree_integrity_error" >&2
   exit 1
 }
+AL_LIO_ATTEMPT_OUTCOME=cutover-starting
+write_attempt_recovery_record
 AL_LIO_CUTOVER_STARTED=1
 docker compose -f infra/docker-compose.prod.yml --env-file .env \
   up -d --no-deps al_lio_web
 wait_for_web_health
 
 [[ "$(docker inspect al_lio_web --format '{{.Config.Image}}')" == "al-lio-web:$AL_LIO_RELEASE_SHA" ]]
-docker exec al_lio_web wget -qO- http://127.0.0.1:3000/api/health >/dev/null
-docker exec al_lio_web wget -qO- http://127.0.0.1:3000/api/ready >/dev/null
-[[ "$(docker exec al_lio_web wget -qO- http://127.0.0.1:3000/api/version)" == \
+timeout 20s docker exec al_lio_web wget -T 5 -qO- \
+  http://127.0.0.1:3000/api/health >/dev/null
+timeout 20s docker exec al_lio_web wget -T 5 -qO- \
+  http://127.0.0.1:3000/api/ready >/dev/null
+[[ "$(timeout 20s docker exec al_lio_web wget -T 5 -qO- \
+  http://127.0.0.1:3000/api/version)" == \
   "{\"releaseSha\":\"$AL_LIO_RELEASE_SHA\"}" ]]
 
 [[ "$(docker inspect al_lio_postgres --format '{{.Id}}')" == "$AL_LIO_POSTGRES_ID" ]]
@@ -677,11 +832,12 @@ authorization boundary. A missing or mismatched `/api/version` fails release
 validation even when health is green.
 
 ```bash
-curl -fsS https://al-lio.app/api/health >/dev/null
-curl -fsS "$AL_LIO_BASE_URL/api/ready" >/dev/null
-[[ "$(curl -fsS "$AL_LIO_BASE_URL/api/version")" == \
+curl -fsS https://al-lio.app/api/health --connect-timeout 5 --max-time 20 >/dev/null
+curl -fsS --connect-timeout 5 --max-time 20 "$AL_LIO_BASE_URL/api/ready" >/dev/null
+[[ "$(curl -fsS --connect-timeout 5 --max-time 20 "$AL_LIO_BASE_URL/api/version")" == \
   "{\"releaseSha\":\"$AL_LIO_RELEASE_SHA\"}" ]]
-[[ "$(curl -sS -o /dev/null -w '%{http_code}' "$AL_LIO_BASE_URL/api/job-radar")" == 401 ]]
+[[ "$(curl -sS --connect-timeout 5 --max-time 20 -o /dev/null -w '%{http_code}' \
+  "$AL_LIO_BASE_URL/api/job-radar")" == 401 ]]
 ```
 
 ## 10. Run the owner functional smoke
@@ -746,9 +902,10 @@ wait_for_web_health
 [[ "$(docker inspect al_lio_web --format '{{.Config.Image}}')" == "al-lio-web:$AL_LIO_RELEASE_SHA" ]]
 [[ "$(docker inspect al_lio_postgres --format '{{.Id}}')" == "$AL_LIO_POSTGRES_ID" ]]
 [[ "$(docker inspect al_lio_radar --format '{{.Id}}')" == "$AL_LIO_RADAR_ID" ]]
-[[ "$(docker exec al_lio_web wget -qO- http://127.0.0.1:3000/api/version)" == \
+[[ "$(timeout 20s docker exec al_lio_web wget -T 5 -qO- \
+  http://127.0.0.1:3000/api/version)" == \
   "{\"releaseSha\":\"$AL_LIO_RELEASE_SHA\"}" ]]
-[[ "$(curl -fsS "$AL_LIO_BASE_URL/api/version")" == \
+[[ "$(curl -fsS --connect-timeout 5 --max-time 20 "$AL_LIO_BASE_URL/api/version")" == \
   "{\"releaseSha\":\"$AL_LIO_RELEASE_SHA\"}" ]]
 confirm_smoke AL_LIO_SMOKE_RESTART_PERSISTENCE \
   "Reload the test account and verify task/note/profile state persisted after restarting only al_lio_web"
@@ -761,7 +918,9 @@ The record contains identifiers and outcomes only. Do not record environment
 values, credentials, tokens or connection strings.
 
 ```bash
-export AL_LIO_RELEASE_RECORD="$AL_LIO_BACKUP_DIR/release-$AL_LIO_RELEASE_STARTED_AT-${AL_LIO_RELEASE_SHA:0:12}.txt"
+[[ "$AL_LIO_RELEASE_RECORD" == "$AL_LIO_ATTEMPT_RECORD" ]]
+AL_LIO_FINAL_RECORD_TEMP="$(mktemp "$AL_LIO_BACKUP_DIR/.final-record.XXXXXX")"
+chmod 600 "$AL_LIO_FINAL_RECORD_TEMP"
 {
   printf 'outcome=approved-exception\n'
   printf 'timestamp_utc=%s\n' "$AL_LIO_RELEASE_STARTED_AT"
@@ -770,14 +929,18 @@ export AL_LIO_RELEASE_RECORD="$AL_LIO_BACKUP_DIR/release-$AL_LIO_RELEASE_STARTED
   printf 'candidate_sha=%s\n' "$AL_LIO_RELEASE_SHA"
   printf 'previous_release_path=%s\n' "$AL_LIO_PREVIOUS_RELEASE_DIR"
   printf 'candidate_release_path=%s\n' "$AL_LIO_RELEASE_DIR"
+  printf 'base_url=%s\n' "$AL_LIO_BASE_URL"
   printf 'previous_image=%s\n' "$AL_LIO_CURRENT_IMAGE"
   printf 'candidate_image=al-lio-web:%s\n' "$AL_LIO_RELEASE_SHA"
+  printf 'postgres_container_id=%s\n' "$AL_LIO_POSTGRES_ID"
+  printf 'radar_container_id=%s\n' "$AL_LIO_RADAR_ID"
   printf 'policy_result=rejected-reviewed-exception\n'
   printf 'historical_exception=%s\n' "$AL_LIO_EXCEPTION_REASON"
   printf 'policy_log=%s\n' "$AL_LIO_POLICY_LOG"
   printf 'staged_approvals=none\nconsumed_approvals=none\nrevoked_approvals=none\n'
   printf 'pending_migration_ids=%s\n' "$AL_LIO_PENDING_MIGRATION_IDS"
   printf 'applied_migration_ids=%s\n' "$AL_LIO_APPLIED_MIGRATION_IDS"
+  printf 'learning_import_result=%s\n' "$AL_LIO_LEARNING_IMPORT_RESULT"
   printf 'db_backup_path=%s\n' "$AL_LIO_POSTGRES_BACKUP"
   printf 'db_backup_checksum=%s\n' "$AL_LIO_POSTGRES_BACKUP_CHECKSUM"
   printf 'restore_verification=%s\n' "$AL_LIO_RESTORE_VERIFICATION"
@@ -804,8 +967,9 @@ export AL_LIO_RELEASE_RECORD="$AL_LIO_BACKUP_DIR/release-$AL_LIO_RELEASE_STARTED
   printf 'rollback_release_path=%s\n' "$AL_LIO_PREVIOUS_RELEASE_DIR"
   printf 'rollback_image=%s\n' "$AL_LIO_CURRENT_IMAGE"
   printf 'rollback_result=not-invoked\n'
-} > "$AL_LIO_RELEASE_RECORD"
-chmod 600 "$AL_LIO_RELEASE_RECORD"
+} > "$AL_LIO_FINAL_RECORD_TEMP"
+mv -f -- "$AL_LIO_FINAL_RECORD_TEMP" "$AL_LIO_RELEASE_RECORD"
+unset AL_LIO_FINAL_RECORD_TEMP
 [[ "$(stat -c '%a' "$AL_LIO_RELEASE_RECORD")" == 600 ]]
 
 AL_LIO_CUTOVER_STARTED=0
@@ -816,32 +980,444 @@ printf 'Release record: %s\n' "$AL_LIO_RELEASE_RECORD"
 Keep the previous release worktree, private `.env`, image and verified backups
 through the observation window.
 
+## Delayed rollback and recovery initialization
+
+Start a new SSH session with this block before either incident path below. It
+parses one exact private release record as data; it never uses `source` or
+`eval`. Unknown, duplicate and malformed keys stop recovery. Only the exact
+historical release `dc6607ec88810d90e43d415e6781bc90e1c6612f` may omit
+`AL_LIO_RELEASE_SHA` or leave it empty; every later release requires its exact
+non-empty SHA.
+
+```bash
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+AL_LIO_RELEASES_DIR=/srv/danicode/releases
+AL_LIO_BACKUP_DIR=/srv/danicode/backups/al-lio
+export AL_LIO_SELECTED_RELEASE_RECORD="REPLACE_WITH_EXACT_PRIVATE_RELEASE_RECORD_PATH"
+
+command -v flock >/dev/null || {
+  printf 'CRITICAL: flock is required to serialize production recovery.\n' >&2
+  exit 1
+}
+exec 9>"$AL_LIO_BACKUP_DIR/deploy-production.lock" || {
+  printf 'CRITICAL: cannot open the shared production deployment lock.\n' >&2
+  exit 1
+}
+if ! flock -n 9; then
+  printf 'CRITICAL: another production deploy or recovery session holds the shared lock.\n' >&2
+  exit 1
+fi
+
+if [[ "$AL_LIO_SELECTED_RELEASE_RECORD" == REPLACE_WITH_* ]]; then
+  printf 'ERROR: select the exact release record before recovery.\n' >&2
+  exit 1
+fi
+[[ "$AL_LIO_SELECTED_RELEASE_RECORD" == /* ]] || {
+  printf 'ERROR: release record path must be absolute.\n' >&2
+  exit 1
+}
+[[ -f "$AL_LIO_SELECTED_RELEASE_RECORD" && ! -L "$AL_LIO_SELECTED_RELEASE_RECORD" ]] || {
+  printf 'ERROR: release record must be a regular file, not a symlink.\n' >&2
+  exit 1
+}
+[[ "$(readlink -f -- "$AL_LIO_SELECTED_RELEASE_RECORD")" == \
+  "$AL_LIO_SELECTED_RELEASE_RECORD" ]] || {
+  printf 'ERROR: release record path is not canonical.\n' >&2
+  exit 1
+}
+[[ "$AL_LIO_SELECTED_RELEASE_RECORD" == "$AL_LIO_BACKUP_DIR"/*.txt ]] || {
+  printf 'ERROR: release record is outside the fixed production backup root.\n' >&2
+  exit 1
+}
+[[ "$(stat -c '%a' "$AL_LIO_SELECTED_RELEASE_RECORD")" == 600 &&
+  "$(stat -c '%u' "$AL_LIO_SELECTED_RELEASE_RECORD")" == "$(id -u)" ]] || {
+  printf 'ERROR: release record must be private mode 600 and owned by this operator.\n' >&2
+  exit 1
+}
+[[ "$(wc -c < "$AL_LIO_SELECTED_RELEASE_RECORD")" -le 65536 ]] || {
+  printf 'ERROR: release record exceeds the 65536-byte limit.\n' >&2
+  exit 1
+}
+command -v od >/dev/null || {
+  printf 'ERROR: od is required for release-record byte validation.\n' >&2
+  exit 1
+}
+if ! LC_ALL=C od -An -v -tu1 -- "$AL_LIO_SELECTED_RELEASE_RECORD" | awk '
+  BEGIN { valid = 1; previous_cr = 0 }
+  {
+    for (field = 1; field <= NF; field++) {
+      byte = $field + 0
+      if (previous_cr && byte != 10) valid = 0
+      if (byte == 13) {
+        previous_cr = 1
+        continue
+      }
+      previous_cr = 0
+      if (byte == 10) continue
+      if (byte < 32 || byte > 126) valid = 0
+    }
+  }
+  END { if (!valid || previous_cr) exit 1 }
+'; then
+  printf 'ERROR: release record contains invalid raw bytes or an unpaired CR.\n' >&2
+  exit 1
+fi
+
+declare -A AL_LIO_RECORD_VALUES=()
+declare -A AL_LIO_RECORD_KEYS_SEEN=()
+while IFS= read -r AL_LIO_RECORD_LINE || [[ -n "$AL_LIO_RECORD_LINE" ]]; do
+  [[ "$AL_LIO_RECORD_LINE" != *$'\r'* && "$AL_LIO_RECORD_LINE" =~ ^([a-z][a-z0-9_]*)=(.*)$ ]] || {
+    printf 'ERROR: malformed release-record line.\n' >&2
+    exit 1
+  }
+  AL_LIO_RECORD_KEY="${BASH_REMATCH[1]}"
+  AL_LIO_RECORD_VALUE="${BASH_REMATCH[2]}"
+  [[ "$AL_LIO_RECORD_VALUE" =~ ^[[:print:]]*$ ]] || {
+    printf 'ERROR: release-record value contains non-printable data.\n' >&2
+    exit 1
+  }
+  case "$AL_LIO_RECORD_KEY" in
+    outcome|timestamp_utc|operator|current_sha|candidate_sha|previous_release_path|candidate_release_path|base_url|previous_image|candidate_image|postgres_container_id|radar_container_id|policy_result|historical_exception|policy_log|staged_approvals|consumed_approvals|revoked_approvals|pending_migration_ids|applied_migration_ids|learning_import_result|db_backup_path|db_backup_checksum|restore_verification|rehearsal|radar_backup|radar_backup_status|internal_health|internal_ready|internal_version|public_health|public_ready|public_version|smoke_result|smoke_login|smoke_google_oauth|smoke_calendar|smoke_dashboard|smoke_task|smoke_note|smoke_profile|smoke_radar_visibility|smoke_radar_delivery|smoke_radar_idempotency|smoke_work|smoke_courses|smoke_events|smoke_restart_persistence|rollback_release_path|rollback_image|rollback_result) ;;
+    *)
+      printf 'ERROR: unknown release-record key: %s\n' "$AL_LIO_RECORD_KEY" >&2
+      exit 1
+      ;;
+  esac
+  [[ -z "${AL_LIO_RECORD_KEYS_SEEN[$AL_LIO_RECORD_KEY]:-}" ]] || {
+    printf 'ERROR: duplicate release-record key: %s\n' "$AL_LIO_RECORD_KEY" >&2
+    exit 1
+  }
+  AL_LIO_RECORD_KEYS_SEEN["$AL_LIO_RECORD_KEY"]=1
+  AL_LIO_RECORD_VALUES["$AL_LIO_RECORD_KEY"]="$AL_LIO_RECORD_VALUE"
+done < "$AL_LIO_SELECTED_RELEASE_RECORD"
+
+for AL_LIO_REQUIRED_RECORD_KEY in outcome current_sha candidate_sha previous_release_path \
+  candidate_release_path base_url previous_image candidate_image \
+  postgres_container_id radar_container_id db_backup_path db_backup_checksum \
+  learning_import_result; do
+  [[ -v "AL_LIO_RECORD_VALUES[$AL_LIO_REQUIRED_RECORD_KEY]" ]] || {
+    printf 'ERROR: release record is missing required key: %s\n' \
+      "$AL_LIO_REQUIRED_RECORD_KEY" >&2
+    exit 1
+  }
+done
+
+export AL_LIO_CURRENT_SHA="${AL_LIO_RECORD_VALUES[current_sha]}"
+export AL_LIO_RELEASE_SHA="${AL_LIO_RECORD_VALUES[candidate_sha]}"
+export AL_LIO_PREVIOUS_RELEASE_DIR="${AL_LIO_RECORD_VALUES[previous_release_path]}"
+export AL_LIO_RELEASE_DIR="${AL_LIO_RECORD_VALUES[candidate_release_path]}"
+export AL_LIO_BASE_URL="${AL_LIO_RECORD_VALUES[base_url]}"
+export AL_LIO_CURRENT_IMAGE="${AL_LIO_RECORD_VALUES[previous_image]}"
+export AL_LIO_CANDIDATE_IMAGE="${AL_LIO_RECORD_VALUES[candidate_image]}"
+export AL_LIO_POSTGRES_ID="${AL_LIO_RECORD_VALUES[postgres_container_id]}"
+export AL_LIO_RADAR_ID="${AL_LIO_RECORD_VALUES[radar_container_id]}"
+export AL_LIO_RECOVERY_BACKUP="${AL_LIO_RECORD_VALUES[db_backup_path]}"
+export AL_LIO_RECOVERY_BACKUP_CHECKSUM="${AL_LIO_RECORD_VALUES[db_backup_checksum]}"
+export AL_LIO_RECOVERY_ATTEMPT_OUTCOME="${AL_LIO_RECORD_VALUES[outcome]}"
+export AL_LIO_RECOVERY_LEARNING_IMPORT_RESULT="${AL_LIO_RECORD_VALUES[learning_import_result]}"
+
+[[ "$AL_LIO_CURRENT_SHA" =~ ^[0-9a-f]{40}$ &&
+  "$AL_LIO_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+  printf 'ERROR: release record contains an invalid release SHA.\n' >&2
+  exit 1
+}
+AL_LIO_EXPECTED_PREVIOUS_RELEASE_DIR="$AL_LIO_RELEASES_DIR/al-lio-${AL_LIO_CURRENT_SHA:0:12}"
+AL_LIO_EXPECTED_CANDIDATE_RELEASE_DIR="$AL_LIO_RELEASES_DIR/al-lio-${AL_LIO_RELEASE_SHA:0:12}"
+[[ "$AL_LIO_PREVIOUS_RELEASE_DIR" == "$AL_LIO_EXPECTED_PREVIOUS_RELEASE_DIR" &&
+  "$AL_LIO_RELEASE_DIR" == "$AL_LIO_EXPECTED_CANDIDATE_RELEASE_DIR" ]] || {
+  printf 'ERROR: recorded release path is outside the exact SHA-derived release root.\n' >&2
+  exit 1
+}
+for AL_LIO_RECORDED_RELEASE_DIR in \
+  "$AL_LIO_EXPECTED_PREVIOUS_RELEASE_DIR" "$AL_LIO_EXPECTED_CANDIDATE_RELEASE_DIR"; do
+  [[ "$AL_LIO_RECORDED_RELEASE_DIR" == /*/al-lio-* &&
+    -d "$AL_LIO_RECORDED_RELEASE_DIR" && ! -L "$AL_LIO_RECORDED_RELEASE_DIR" &&
+    "$(readlink -f -- "$AL_LIO_RECORDED_RELEASE_DIR")" == "$AL_LIO_RECORDED_RELEASE_DIR" ]] || {
+    printf 'ERROR: release record contains an invalid immutable release path.\n' >&2
+    exit 1
+  }
+done
+[[ "$AL_LIO_CURRENT_IMAGE" == "al-lio-web:$AL_LIO_CURRENT_SHA" &&
+  "$AL_LIO_CANDIDATE_IMAGE" == "al-lio-web:$AL_LIO_RELEASE_SHA" &&
+  "$AL_LIO_BASE_URL" == https://* ]] || {
+  printf 'ERROR: release record contains inconsistent runtime identity.\n' >&2
+  exit 1
+}
+
+read_env_value() {
+  local key="$1" env_file="$2" line value
+  line="$(grep -E "^${key}=" "$env_file" | tail -n 1 || true)"
+  [[ -n "$line" ]] || return 1
+  value="${line#*=}"
+  value="${value%$'\r'}"
+  if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+    value="${value:1:${#value}-2}"
+  elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "$value"
+}
+
+validate_recovery_integrity_helper_blob() {
+  local metadata entry_path mode type object
+  IFS=$'\t' read -r metadata entry_path < <(
+    git -C "$AL_LIO_RELEASE_DIR" ls-tree "$AL_LIO_RELEASE_SHA" -- \
+      scripts/lib/release-worktree-integrity.sh
+  )
+  read -r mode type object <<< "$metadata"
+  [[ "$entry_path" == scripts/lib/release-worktree-integrity.sh &&
+    "$mode" == 100644 && "$type" == blob &&
+    "$object" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || {
+    printf 'ERROR: candidate release-worktree integrity helper is not an exact 100644 blob.\n' >&2
+    return 1
+  }
+  printf '%s' "$object"
+}
+
+AL_LIO_RECOVERY_INTEGRITY_OBJECT="$(validate_recovery_integrity_helper_blob)" || exit 1
+AL_LIO_RECOVERY_VALIDATOR_DIR="$(
+  mktemp -d "$AL_LIO_BACKUP_DIR/.recovery-integrity.XXXXXX"
+)" || {
+  printf 'ERROR: cannot create the private recovery integrity directory.\n' >&2
+  exit 1
+}
+AL_LIO_RECOVERY_INTEGRITY_HELPER="$AL_LIO_RECOVERY_VALIDATOR_DIR/release-worktree-integrity.sh"
+cleanup_recovery_integrity_helper() {
+  local cleanup_failed=0
+  if [[ -e "${AL_LIO_RECOVERY_INTEGRITY_HELPER:-}" ||
+    -L "${AL_LIO_RECOVERY_INTEGRITY_HELPER:-}" ]]; then
+    rm -f -- "$AL_LIO_RECOVERY_INTEGRITY_HELPER" || cleanup_failed=1
+  fi
+  if [[ -d "${AL_LIO_RECOVERY_VALIDATOR_DIR:-}" ]]; then
+    rmdir -- "$AL_LIO_RECOVERY_VALIDATOR_DIR" || cleanup_failed=1
+  fi
+  [[ "$cleanup_failed" -eq 0 ]] || {
+    printf 'ERROR: private recovery integrity directory cleanup failed.\n' >&2
+    return 1
+  }
+}
+if ! chmod 700 "$AL_LIO_RECOVERY_VALIDATOR_DIR"; then
+  printf 'ERROR: cannot protect the private recovery integrity directory.\n' >&2
+  if ! cleanup_recovery_integrity_helper; then
+    exit 1
+  fi
+  exit 1
+fi
+if ! git -C "$AL_LIO_RELEASE_DIR" cat-file blob \
+  "$AL_LIO_RECOVERY_INTEGRITY_OBJECT" > "$AL_LIO_RECOVERY_INTEGRITY_HELPER" ||
+  ! chmod 600 "$AL_LIO_RECOVERY_INTEGRITY_HELPER"; then
+  printf 'ERROR: cannot extract the reviewed recovery integrity helper.\n' >&2
+  if ! cleanup_recovery_integrity_helper; then
+    exit 1
+  fi
+  exit 1
+fi
+if ! source "$AL_LIO_RECOVERY_INTEGRITY_HELPER"; then
+  printf 'ERROR: reviewed recovery integrity helper could not be loaded.\n' >&2
+  if ! cleanup_recovery_integrity_helper; then
+    exit 1
+  fi
+  exit 1
+fi
+if ! cleanup_recovery_integrity_helper; then
+  exit 1
+fi
+unset AL_LIO_RECOVERY_INTEGRITY_OBJECT AL_LIO_RECOVERY_INTEGRITY_HELPER \
+  AL_LIO_RECOVERY_VALIDATOR_DIR
+unset -f cleanup_recovery_integrity_helper validate_recovery_integrity_helper_blob
+
+AL_LIO_HISTORICAL_LEGACY_RELEASE_SHA=dc6607ec88810d90e43d415e6781bc90e1c6612f
+resolve_previous_identity_requirement() {
+  if [[ "$1" == "$AL_LIO_HISTORICAL_LEGACY_RELEASE_SHA" ]]; then
+    printf 'optional'
+  else
+    printf 'required'
+  fi
+}
+AL_LIO_PREVIOUS_IDENTITY_REQUIREMENT="$(
+  resolve_previous_identity_requirement "$AL_LIO_CURRENT_SHA"
+)"
+
+validate_recovery_worktree() {
+  local label="$1" release_dir="$2" expected_sha="$3" identity_requirement="$4"
+  local env_file="$release_dir/.env" image_tag release_identity
+  if ! validate_release_worktree_integrity "$release_dir" "$expected_sha"; then
+    printf 'ERROR: %s worktree integrity failed: %s\n' \
+      "$label" "$release_worktree_integrity_error" >&2
+    return 1
+  fi
+  [[ -f "$env_file" && ! -L "$env_file" &&
+    "$(readlink -f -- "$env_file")" == "$env_file" ]] || {
+    printf 'ERROR: %s release .env must be one canonical regular file.\n' "$label" >&2
+    return 1
+  }
+  [[ "$(stat -c %a -- "$env_file")" == 600 &&
+    "$(stat -c %u -- "$env_file")" == "$(id -u)" ]] || {
+    printf 'ERROR: %s release .env must be mode 600 and owned by the operator.\n' \
+      "$label" >&2
+    return 1
+  }
+  image_tag="$(read_env_value AL_LIO_IMAGE_TAG "$env_file")" || {
+    printf 'ERROR: %s release .env has no AL_LIO_IMAGE_TAG.\n' "$label" >&2
+    return 1
+  }
+  [[ "$image_tag" == "$expected_sha" ]] || {
+    printf 'ERROR: %s release image tag does not match its SHA.\n' "$label" >&2
+    return 1
+  }
+  case "$identity_requirement" in
+    required)
+      release_identity="$(read_env_value AL_LIO_RELEASE_SHA "$env_file")" || {
+        printf 'ERROR: %s release .env has no mandatory AL_LIO_RELEASE_SHA.\n' \
+          "$label" >&2
+        return 1
+      }
+      [[ -n "$release_identity" ]] || {
+        printf 'ERROR: %s release .env has an empty mandatory AL_LIO_RELEASE_SHA.\n' \
+          "$label" >&2
+        return 1
+      }
+      [[ "$release_identity" == "$expected_sha" ]] || {
+        printf 'ERROR: %s release identity does not match its SHA.\n' "$label" >&2
+        return 1
+      }
+      ;;
+    optional)
+      release_identity="$(read_env_value AL_LIO_RELEASE_SHA "$env_file" || true)"
+      [[ -z "$release_identity" || "$release_identity" == "$expected_sha" ]] || {
+        printf 'ERROR: %s release identity does not match its SHA.\n' "$label" >&2
+        return 1
+      }
+      ;;
+    *)
+      printf 'ERROR: invalid recovery release-identity requirement.\n' >&2
+      return 1
+      ;;
+  esac
+}
+
+validate_recovery_worktree previous \
+  "$AL_LIO_PREVIOUS_RELEASE_DIR" "$AL_LIO_CURRENT_SHA" \
+  "$AL_LIO_PREVIOUS_IDENTITY_REQUIREMENT"
+validate_recovery_worktree candidate \
+  "$AL_LIO_RELEASE_DIR" "$AL_LIO_RELEASE_SHA" required
+
+AL_LIO_RECOVERY_INCIDENT_LOG="${AL_LIO_SELECTED_RELEASE_RECORD%.txt}-recovery-$(date -u +%Y%m%dT%H%M%SZ).txt"
+record_delayed_recovery_event() {
+  local action="$1" result="$2" detail="$3"
+  {
+    printf 'timestamp_utc=%s action=%s result=%s detail=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$action" "$result" "$detail"
+  } >> "$AL_LIO_RECOVERY_INCIDENT_LOG" || return 1
+  chmod 600 "$AL_LIO_RECOVERY_INCIDENT_LOG"
+}
+
+wait_for_web_health() {
+  local attempt state health
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    state="$(docker inspect al_lio_web --format '{{.State.Status}}' 2>/dev/null || true)"
+    health="$(docker inspect al_lio_web --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' 2>/dev/null || true)"
+    [[ "$state" == running && "$health" == healthy ]] && return 0
+    [[ "$state" == exited || "$health" == unhealthy ]] && return 1
+    sleep 5
+  done
+  return 1
+}
+
+unset AL_LIO_RECORD_LINE AL_LIO_RECORD_KEY AL_LIO_RECORD_VALUE \
+  AL_LIO_REQUIRED_RECORD_KEY AL_LIO_RECORDED_RELEASE_DIR \
+  AL_LIO_EXPECTED_PREVIOUS_RELEASE_DIR AL_LIO_EXPECTED_CANDIDATE_RELEASE_DIR
+unset AL_LIO_RECORD_KEYS_SEEN AL_LIO_RECORD_VALUES
+```
+
 ## Application rollback
 
 Application rollback uses the previous immutable release and its own `.env`.
 It does not rewrite either checkout and does not reverse additive migrations.
 
 ```bash
-cd "$AL_LIO_PREVIOUS_RELEASE_DIR"
-docker compose -f infra/docker-compose.prod.yml --env-file .env \
-  up -d --no-deps al_lio_web
-wait_for_web_health
+perform_application_rollback() {
+  local active_web_image active_postgres_id active_radar_id
+  validate_recovery_worktree previous \
+    "$AL_LIO_PREVIOUS_RELEASE_DIR" "$AL_LIO_CURRENT_SHA" \
+    "$AL_LIO_PREVIOUS_IDENTITY_REQUIREMENT" || return 1
 
-[[ "$(docker inspect al_lio_web --format '{{.Config.Image}}')" == "$AL_LIO_CURRENT_IMAGE" ]]
-docker exec al_lio_web wget -qO- http://127.0.0.1:3000/api/health >/dev/null
-docker exec al_lio_web wget -qO- http://127.0.0.1:3000/api/ready >/dev/null
-curl -fsS "$AL_LIO_BASE_URL/api/health" >/dev/null
-curl -fsS "$AL_LIO_BASE_URL/api/ready" >/dev/null
+  active_web_image="$(
+    docker inspect al_lio_web --format '{{.Config.Image}}'
+  )" || {
+    printf 'CRITICAL: cannot inspect the active web image before application rollback.\n' >&2
+    return 1
+  }
+  if [[ "$active_web_image" != "$AL_LIO_CANDIDATE_IMAGE" &&
+    "$active_web_image" != "$AL_LIO_CURRENT_IMAGE" ]]; then
+    printf 'CRITICAL: active web image does not match the selected recovery record.\n' >&2
+    return 1
+  fi
+  active_postgres_id="$(
+    docker inspect al_lio_postgres --format '{{.Id}}'
+  )" || {
+    printf 'CRITICAL: cannot inspect PostgreSQL before application rollback.\n' >&2
+    return 1
+  }
+  [[ "$active_postgres_id" == "$AL_LIO_POSTGRES_ID" ]] || {
+    printf 'CRITICAL: PostgreSQL container identity does not match the selected recovery record.\n' >&2
+    return 1
+  }
+  active_radar_id="$(
+    docker inspect al_lio_radar --format '{{.Id}}'
+  )" || {
+    printf 'CRITICAL: cannot inspect Radar before application rollback.\n' >&2
+    return 1
+  }
+  [[ "$active_radar_id" == "$AL_LIO_RADAR_ID" ]] || {
+    printf 'CRITICAL: Radar container identity does not match the selected recovery record.\n' >&2
+    return 1
+  }
 
-AL_LIO_ROLLBACK_RELEASE_IDENTITY="$(read_env_value AL_LIO_RELEASE_SHA .env || true)"
-if [[ -n "$AL_LIO_ROLLBACK_RELEASE_IDENTITY" ]]; then
-  [[ "$AL_LIO_ROLLBACK_RELEASE_IDENTITY" == "$AL_LIO_CURRENT_SHA" ]]
-  [[ "$(curl -fsS "$AL_LIO_BASE_URL/api/version")" == \
-    "{\"releaseSha\":\"$AL_LIO_CURRENT_SHA\"}" ]]
+  cd "$AL_LIO_PREVIOUS_RELEASE_DIR" || return 1
+  docker compose -f infra/docker-compose.prod.yml --env-file .env \
+    up -d --no-deps al_lio_web || return 1
+  wait_for_web_health || return 1
+  [[ "$(docker inspect al_lio_web --format '{{.Config.Image}}')" == \
+    "$AL_LIO_CURRENT_IMAGE" ]] || return 1
+  timeout 20s docker exec al_lio_web wget -T 5 -qO- \
+    http://127.0.0.1:3000/api/health >/dev/null || return 1
+  timeout 20s docker exec al_lio_web wget -T 5 -qO- \
+    http://127.0.0.1:3000/api/ready >/dev/null || return 1
+  curl -fsS --connect-timeout 5 --max-time 20 \
+    "$AL_LIO_BASE_URL/api/health" >/dev/null || return 1
+  curl -fsS --connect-timeout 5 --max-time 20 \
+    "$AL_LIO_BASE_URL/api/ready" >/dev/null || return 1
+
+  AL_LIO_ROLLBACK_RELEASE_IDENTITY="$(read_env_value AL_LIO_RELEASE_SHA .env || true)"
+  if [[ -n "$AL_LIO_ROLLBACK_RELEASE_IDENTITY" ]]; then
+    [[ "$AL_LIO_ROLLBACK_RELEASE_IDENTITY" == "$AL_LIO_CURRENT_SHA" ]] || return 1
+    [[ "$(curl -fsS --connect-timeout 5 --max-time 20 \
+      "$AL_LIO_BASE_URL/api/version")" == \
+      "{\"releaseSha\":\"$AL_LIO_CURRENT_SHA\"}" ]] || return 1
+  fi
+  [[ "$(docker inspect al_lio_postgres --format '{{.Id}}')" == \
+    "$AL_LIO_POSTGRES_ID" ]] || return 1
+  [[ "$(docker inspect al_lio_radar --format '{{.Id}}')" == \
+    "$AL_LIO_RADAR_ID" ]] || return 1
+  [[ "$(docker inspect al_lio_radar --format '{{.State.Status}}')" == running ]] || return 1
+}
+
+if ! perform_application_rollback; then
+  printf 'CRITICAL: application rollback failed; production requires operator recovery.\n' >&2
+  record_delayed_recovery_event application-rollback failed runtime-validation || {
+    printf 'CRITICAL: rollback failure evidence could not be written.\n' >&2
+  }
+  exit 1
 fi
-[[ "$(docker inspect al_lio_postgres --format '{{.Id}}')" == "$AL_LIO_POSTGRES_ID" ]]
-[[ "$(docker inspect al_lio_radar --format '{{.Id}}')" == "$AL_LIO_RADAR_ID" ]]
-[[ "$(docker inspect al_lio_radar --format '{{.State.Status}}')" == running ]]
+record_delayed_recovery_event application-rollback restored previous-release || {
+  printf 'CRITICAL: rollback completed but evidence could not be written.\n' >&2
+  exit 1
+}
+printf 'Application rollback restored the recorded previous release. Evidence: %s\n' \
+  "$AL_LIO_RECOVERY_INCIDENT_LOG"
 ```
 
 ## Database recovery after an incompatible migration
@@ -852,22 +1428,130 @@ damaged state, and stop both writers. This is never routine application
 rollback.
 
 ```bash
-export AL_LIO_RECOVERY_BACKUP="REPLACE_WITH_EXACT_VERIFIED_DUMP_FROM_RELEASE_RECORD"
-if [[ "$AL_LIO_RECOVERY_BACKUP" == REPLACE_WITH_* ]]; then
-  printf 'ERROR: select the exact verified dump from the release record.\n' >&2
+[[ "$AL_LIO_RECOVERY_BACKUP" != not-required &&
+  "$AL_LIO_RECOVERY_BACKUP_CHECKSUM" =~ ^[0-9a-f]{64}$ ]] || {
+  printf 'ERROR: selected release record has no exact database recovery point.\n' >&2
   exit 1
-fi
-[[ -s "$AL_LIO_RECOVERY_BACKUP" ]]
-[[ -s "$AL_LIO_RECOVERY_BACKUP.sha256" ]]
+}
+[[ "$AL_LIO_RECOVERY_BACKUP" == "$AL_LIO_BACKUP_DIR"/*.dump &&
+  -f "$AL_LIO_RECOVERY_BACKUP" &&
+  ! -L "$AL_LIO_RECOVERY_BACKUP" && -s "$AL_LIO_RECOVERY_BACKUP" ]] || {
+  printf 'ERROR: recorded database backup is not one exact regular file.\n' >&2
+  exit 1
+}
+[[ "$(readlink -f -- "$AL_LIO_RECOVERY_BACKUP")" == "$AL_LIO_RECOVERY_BACKUP" &&
+  -f "$AL_LIO_RECOVERY_BACKUP.sha256" && ! -L "$AL_LIO_RECOVERY_BACKUP.sha256" ]] || {
+  printf 'ERROR: recorded database backup path or checksum sidecar is invalid.\n' >&2
+  exit 1
+}
+[[ "$(sha256sum "$AL_LIO_RECOVERY_BACKUP" | awk '{ print $1 }')" == \
+  "$AL_LIO_RECOVERY_BACKUP_CHECKSUM" ]] || {
+  printf 'ERROR: recorded database backup checksum does not match.\n' >&2
+  exit 1
+}
+[[ "$(cat -- "$AL_LIO_RECOVERY_BACKUP.sha256")" == \
+  "$AL_LIO_RECOVERY_BACKUP_CHECKSUM  $AL_LIO_RECOVERY_BACKUP" ]] || {
+  printf 'ERROR: database backup checksum sidecar has different provenance.\n' >&2
+  exit 1
+}
 sha256sum --check "$AL_LIO_RECOVERY_BACKUP.sha256"
+validate_recovery_worktree candidate \
+  "$AL_LIO_RELEASE_DIR" "$AL_LIO_RELEASE_SHA" required || {
+  printf 'CRITICAL: candidate recovery worktree validation failed.\n' >&2
+  exit 1
+}
+AL_LIO_PRE_VERIFY_POSTGRES_ID="$(
+  docker inspect al_lio_postgres --format '{{.Id}}'
+)" || {
+  printf 'CRITICAL: cannot inspect PostgreSQL before backup verification.\n' >&2
+  exit 1
+}
+[[ "$AL_LIO_PRE_VERIFY_POSTGRES_ID" == "$AL_LIO_POSTGRES_ID" ]] || {
+  printf 'CRITICAL: PostgreSQL container identity changed before backup verification.\n' >&2
+  exit 1
+}
+unset AL_LIO_PRE_VERIFY_POSTGRES_ID
+AL_LIO_PRE_VERIFY_POSTGRES_IDENTITY=validated
 bash "$AL_LIO_RELEASE_DIR/scripts/postgres/verify-backup-production.sh" \
   "$AL_LIO_RECOVERY_BACKUP"
 
-AL_LIO_BACKUP_DIR="$AL_LIO_BACKUP_DIR/damaged-state" \
-  bash "$AL_LIO_RELEASE_DIR/scripts/postgres/backup-production.sh"
+validate_pre_destructive_container_identity() {
+  local actual_postgres_id actual_radar_id actual_web_image
+  actual_postgres_id="$(docker inspect al_lio_postgres --format '{{.Id}}')" || {
+    printf 'CRITICAL: cannot inspect the recorded PostgreSQL container.\n' >&2
+    return 1
+  }
+  actual_radar_id="$(docker inspect al_lio_radar --format '{{.Id}}')" || {
+    printf 'CRITICAL: cannot inspect the recorded Radar container.\n' >&2
+    return 1
+  }
+  actual_web_image="$(docker inspect al_lio_web --format '{{.Config.Image}}')" || {
+    printf 'CRITICAL: cannot inspect the recorded web runtime.\n' >&2
+    return 1
+  }
+  [[ "$actual_postgres_id" == "$AL_LIO_POSTGRES_ID" &&
+    "$actual_radar_id" == "$AL_LIO_RADAR_ID" &&
+    ( "$actual_web_image" == "$AL_LIO_CURRENT_IMAGE" ||
+      "$actual_web_image" == "$AL_LIO_CANDIDATE_IMAGE" ) ]] || {
+    printf 'CRITICAL: recorded container identity does not match the recovery target.\n' >&2
+    return 1
+  }
+}
 
+if ! validate_pre_destructive_container_identity; then
+  exit 1
+fi
+AL_LIO_PRE_DESTRUCTIVE_CONTAINER_IDENTITY=validated
 docker stop --time 30 al_lio_radar >/dev/null
 docker stop --time 30 al_lio_web >/dev/null
+[[ "$(docker inspect al_lio_radar --format '{{.State.Status}}')" == exited &&
+  "$(docker inspect al_lio_web --format '{{.State.Status}}')" == exited ]] || {
+  printf 'CRITICAL: both application writers must be stopped before damaged-state backup.\n' >&2
+  exit 1
+}
+
+AL_LIO_DAMAGED_BACKUP_DIR="$(dirname "$AL_LIO_SELECTED_RELEASE_RECORD")/damaged-state"
+validate_recovery_worktree candidate \
+  "$AL_LIO_RELEASE_DIR" "$AL_LIO_RELEASE_SHA" required || {
+  printf 'CRITICAL: candidate recovery worktree changed before damaged-state backup.\n' >&2
+  exit 1
+}
+AL_LIO_DAMAGED_BACKUP_OUTPUT="$(
+  AL_LIO_BACKUP_DIR="$AL_LIO_DAMAGED_BACKUP_DIR" \
+    bash "$AL_LIO_RELEASE_DIR/scripts/postgres/backup-production.sh"
+)"
+mapfile -t AL_LIO_DAMAGED_BACKUP_PATHS < <(
+  sed -n 's/^Backup creado y validado: //p' <<< "$AL_LIO_DAMAGED_BACKUP_OUTPUT"
+)
+[[ "${#AL_LIO_DAMAGED_BACKUP_PATHS[@]}" -eq 1 ]]
+AL_LIO_DAMAGED_STATE_BACKUP="${AL_LIO_DAMAGED_BACKUP_PATHS[0]}"
+unset AL_LIO_DAMAGED_BACKUP_PATHS
+[[ "$AL_LIO_DAMAGED_STATE_BACKUP" == "$AL_LIO_DAMAGED_BACKUP_DIR"/*.dump &&
+  -f "$AL_LIO_DAMAGED_STATE_BACKUP" && ! -L "$AL_LIO_DAMAGED_STATE_BACKUP" &&
+  -s "$AL_LIO_DAMAGED_STATE_BACKUP" &&
+  "$(readlink -f -- "$AL_LIO_DAMAGED_STATE_BACKUP")" == \
+    "$AL_LIO_DAMAGED_STATE_BACKUP" &&
+  -f "$AL_LIO_DAMAGED_STATE_BACKUP.sha256" &&
+  ! -L "$AL_LIO_DAMAGED_STATE_BACKUP.sha256" ]] || {
+  printf 'CRITICAL: damaged-state backup path is not exact and regular.\n' >&2
+  exit 1
+}
+AL_LIO_DAMAGED_STATE_BACKUP_CHECKSUM="$(
+  sha256sum "$AL_LIO_DAMAGED_STATE_BACKUP" | awk '{ print $1 }'
+)"
+[[ "$AL_LIO_DAMAGED_STATE_BACKUP_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]
+[[ "$(cat -- "$AL_LIO_DAMAGED_STATE_BACKUP.sha256")" == \
+  "$AL_LIO_DAMAGED_STATE_BACKUP_CHECKSUM  $AL_LIO_DAMAGED_STATE_BACKUP" ]]
+sha256sum --check "$AL_LIO_DAMAGED_STATE_BACKUP.sha256"
+record_delayed_recovery_event database-recovery damaged-state-preserved \
+  "$AL_LIO_DAMAGED_STATE_BACKUP:$AL_LIO_DAMAGED_STATE_BACKUP_CHECKSUM" || {
+  printf 'CRITICAL: damaged-state backup evidence could not be written.\n' >&2
+  exit 1
+}
+
+if ! validate_pre_destructive_container_identity; then
+  exit 1
+fi
 docker exec al_lio_postgres psql -U al_lio -d postgres -v ON_ERROR_STOP=1 -c \
   "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'al_lio' AND pid <> pg_backend_pid();"
 docker exec al_lio_postgres dropdb -U al_lio al_lio
@@ -876,14 +1560,52 @@ docker exec -i al_lio_postgres pg_restore \
   -U al_lio -d al_lio --exit-on-error --no-owner --no-acl \
   < "$AL_LIO_RECOVERY_BACKUP"
 
-cd "$AL_LIO_PREVIOUS_RELEASE_DIR"
-docker compose -f infra/docker-compose.prod.yml --env-file .env \
-  up -d --no-deps al_lio_web
-wait_for_web_health
-docker start al_lio_radar >/dev/null
-docker exec al_lio_web wget -qO- http://127.0.0.1:3000/api/ready >/dev/null
-curl -fsS "$AL_LIO_BASE_URL/api/health" >/dev/null
-curl -fsS "$AL_LIO_BASE_URL/api/ready" >/dev/null
+perform_database_recovery_runtime_validation() {
+  local release_identity
+  validate_recovery_worktree previous \
+    "$AL_LIO_PREVIOUS_RELEASE_DIR" "$AL_LIO_CURRENT_SHA" \
+    "$AL_LIO_PREVIOUS_IDENTITY_REQUIREMENT" || return 1
+  cd "$AL_LIO_PREVIOUS_RELEASE_DIR" || return 1
+  docker compose -f infra/docker-compose.prod.yml --env-file .env \
+    up -d --no-deps al_lio_web || return 1
+  wait_for_web_health || return 1
+  docker start al_lio_radar >/dev/null || return 1
+  [[ "$(docker inspect al_lio_web --format '{{.Config.Image}}')" == \
+    "$AL_LIO_CURRENT_IMAGE" ]] || return 1
+  [[ "$(docker inspect al_lio_postgres --format '{{.Id}}')" == \
+    "$AL_LIO_POSTGRES_ID" ]] || return 1
+  [[ "$(docker inspect al_lio_radar --format '{{.Id}}')" == \
+    "$AL_LIO_RADAR_ID" ]] || return 1
+  [[ "$(docker inspect al_lio_radar --format '{{.State.Status}}')" == running ]] || return 1
+  timeout 20s docker exec al_lio_web wget -T 5 -qO- \
+    http://127.0.0.1:3000/api/health >/dev/null || return 1
+  timeout 20s docker exec al_lio_web wget -T 5 -qO- \
+    http://127.0.0.1:3000/api/ready >/dev/null || return 1
+  curl -fsS --connect-timeout 5 --max-time 20 \
+    "$AL_LIO_BASE_URL/api/health" >/dev/null || return 1
+  curl -fsS --connect-timeout 5 --max-time 20 \
+    "$AL_LIO_BASE_URL/api/ready" >/dev/null || return 1
+  release_identity="$(read_env_value AL_LIO_RELEASE_SHA .env || true)"
+  if [[ -n "$release_identity" ]]; then
+    [[ "$release_identity" == "$AL_LIO_CURRENT_SHA" ]] || return 1
+    [[ "$(timeout 20s docker exec al_lio_web wget -T 5 -qO- \
+      http://127.0.0.1:3000/api/version)" == \
+      "{\"releaseSha\":\"$AL_LIO_CURRENT_SHA\"}" ]] || return 1
+    [[ "$(curl -fsS --connect-timeout 5 --max-time 20 \
+      "$AL_LIO_BASE_URL/api/version")" == \
+      "{\"releaseSha\":\"$AL_LIO_CURRENT_SHA\"}" ]] || return 1
+  fi
+}
+
+if ! perform_database_recovery_runtime_validation; then
+  printf 'CRITICAL: database recovery runtime identity validation failed.\n' >&2
+  record_delayed_recovery_event database-recovery failed runtime-identity || {
+    printf 'CRITICAL: database recovery failure evidence could not be written.\n' >&2
+  }
+  exit 1
+fi
+record_delayed_recovery_event database-recovery restored \
+  "$AL_LIO_RECOVERY_BACKUP:$AL_LIO_RECOVERY_BACKUP_CHECKSUM"
 ```
 
 Record the recovery point, damaged-state backup, authorization and validation
