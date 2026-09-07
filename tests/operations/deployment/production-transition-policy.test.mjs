@@ -1,6 +1,11 @@
+// Source-level assertion rationale: the real shell transition policy is executed
+// for every protected path below. The supplemental inventory-parity assertion
+// reads the shell and CLI sources because their static path lists are not exposed
+// as an importable runtime boundary.
+
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +18,39 @@ const policyPath = fileURLToPath(new URL("../../../scripts/lib/production-transi
 const bashPath = process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash";
 const approvalPath = "scripts/config/production-compose-env-removals.allowlist";
 const secretSentinel = "SUPER_SECRET_SENTINEL_9f0e7d";
+const readinessPath = fileURLToPath(new URL("../../../scripts/validate-production-deploy-readiness.mjs", import.meta.url));
+
+const protectedControlPlaneCases = [
+  { policyEntry: ".dockerignore" },
+  { policyEntry: ".github/workflows/ci.yml" },
+  { policyEntry: ".github/workflows/deploy-production.yml" },
+  { policyEntry: "scripts/deploy-production.sh" },
+  { policyEntry: "scripts/github-actions-deploy-entrypoint.sh" },
+  { policyEntry: "scripts/lib/production-transition-policy.sh" },
+  { policyEntry: "scripts/lib/compose-env-guard.sh" },
+  { policyEntry: "scripts/lib/release-worktree-integrity.sh" },
+  { policyEntry: "scripts/prepare-release-env.sh" },
+  { policyEntry: "scripts/validate-production-transition.sh" },
+  { policyEntry: "scripts/validate-production-deploy-readiness.mjs" },
+  { policyEntry: "scripts/validate-runtime-env.mjs" },
+  { policyEntry: "src/app/api/version/route.ts" },
+  { policyEntry: "src/app/api/ready/route.ts" },
+  { policyEntry: "src/lib/db/pool.ts" },
+  {
+    policyEntry: "scripts/postgres",
+    behavioralPaths: [
+      "scripts/postgres/migrate.mjs",
+      "scripts/postgres/backup-production.sh",
+    ],
+  },
+  { policyEntry: "infra/postgres/schema.sql" },
+  { policyEntry: "infra/postgres/baseline.sha256" },
+];
+const protectedControlPlaneEntries = protectedControlPlaneCases.map(({ policyEntry }) => policyEntry);
+const behavioralProtectedPaths = [
+  ".gitattributes",
+  ...protectedControlPlaneCases.flatMap(({ policyEntry, behavioralPaths }) => behavioralPaths ?? [policyEntry]),
+];
 
 const compose = `services:
   al_lio_web:
@@ -51,25 +89,14 @@ async function createFixture({ composeContent = compose, approvalContent = "# no
   await write(root, ".gitattributes", "*.sh text eol=lf\n");
   await write(root, approvalPath, approvalContent);
   await write(root, "infra/postgres/migrations/0002_existing.sql", "CREATE TABLE existing_record (id bigint);\n");
-  for (const path of [
-    ".dockerignore",
-    ".github/workflows/ci.yml",
-    ".github/workflows/deploy-production.yml",
-    "scripts/deploy-production.sh",
-    "scripts/github-actions-deploy-entrypoint.sh",
-    "scripts/lib/production-transition-policy.sh",
-    "scripts/lib/compose-env-guard.sh",
-    "scripts/lib/release-worktree-integrity.sh",
-    "scripts/prepare-release-env.sh",
-    "scripts/validate-production-transition.sh",
-    "scripts/validate-production-deploy-readiness.mjs",
-    "scripts/postgres/migrate.mjs",
-    "scripts/postgres/backup-production.sh",
-    "infra/postgres/schema.sql",
-    "infra/postgres/baseline.sha256",
-  ]) {
+  for (const path of behavioralProtectedPaths.filter((path) => path !== ".gitattributes")) {
     await write(root, path, `trusted control-plane fixture: ${path}\n`);
   }
+  await write(
+    root,
+    "src/lib/db/pool.ts",
+    "export async function checkDatabaseConnection(): Promise<void> {\n  await getPool().query(\"SELECT 1\");\n}\n",
+  );
   await git(root, "add", ".");
   await git(root, "commit", "--quiet", "-m", "current");
   const currentSha = await git(root, "rev-parse", "HEAD");
@@ -155,24 +182,7 @@ test("the shared policy accepts a forward main transition with an additive migra
   });
 });
 
-for (const protectedPath of [
-  ".dockerignore",
-  ".gitattributes",
-  ".github/workflows/ci.yml",
-  ".github/workflows/deploy-production.yml",
-  "scripts/deploy-production.sh",
-  "scripts/github-actions-deploy-entrypoint.sh",
-  "scripts/lib/production-transition-policy.sh",
-  "scripts/lib/compose-env-guard.sh",
-  "scripts/lib/release-worktree-integrity.sh",
-  "scripts/prepare-release-env.sh",
-  "scripts/validate-production-transition.sh",
-  "scripts/validate-production-deploy-readiness.mjs",
-  "scripts/postgres/migrate.mjs",
-  "scripts/postgres/backup-production.sh",
-  "infra/postgres/schema.sql",
-  "infra/postgres/baseline.sha256",
-]) {
+for (const protectedPath of behavioralProtectedPaths) {
   test(`the shared policy rejects protected control-plane change: ${protectedPath}`, async () => {
     await withFixture(async (fixture) => {
       const candidateSha = await commitCandidate(fixture, async (root) => {
@@ -191,6 +201,41 @@ for (const protectedPath of [
     });
   });
 }
+
+test("the shared policy rejects bypassing database readiness in src/lib/db/pool.ts", async () => {
+  await withFixture(async (fixture) => {
+    const candidateSha = await commitCandidate(fixture, async (root) => {
+      await write(
+        root,
+        "src/lib/db/pool.ts",
+        "export async function checkDatabaseConnection(): Promise<void> {\n  return;\n}\n",
+      );
+    });
+    assert.deepEqual(
+      (await git(fixture.root, "diff", "--name-only", fixture.currentSha, candidateSha)).split("\n"),
+      ["src/lib/db/pool.ts"],
+    );
+    await assert.rejects(
+      runPolicy(fixture, fixture.currentSha, candidateSha),
+      /protected production control-plane/,
+    );
+  });
+});
+
+test("policy, readiness, and behavioral protected control-plane inventories stay aligned", async () => {
+  const [policy, readiness] = await Promise.all([
+    readFile(policyPath, "utf8"),
+    readFile(readinessPath, "utf8"),
+  ]);
+  const policyBlock = policy.match(/readonly -a PRODUCTION_TRANSITION_PROTECTED_CONTROL_PLANE=\(\n(?<entries>[\s\S]*?)\n\)/)?.groups?.entries;
+  const readinessBlock = readiness.match(/const expectedProtectedControlPlanePaths = \[\n(?<entries>[\s\S]*?)\n\];/)?.groups?.entries;
+  assert.ok(policyBlock, "production policy protected-path inventory must be parseable");
+  assert.ok(readinessBlock, "readiness protected-path inventory must be parseable");
+
+  const quotedEntries = (block) => [...block.matchAll(/^\s*"([^"]+)",?$/gm)].map((match) => match[1]);
+  assert.deepEqual(quotedEntries(policyBlock), protectedControlPlaneEntries);
+  assert.deepEqual(quotedEntries(readinessBlock), protectedControlPlaneEntries);
+});
 
 for (const nestedAttributesPath of [
   "scripts/.gitattributes",

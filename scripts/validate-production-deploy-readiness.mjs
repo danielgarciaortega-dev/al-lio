@@ -182,24 +182,36 @@ check("shared policy accepts only commits reachable from main", transitionPolicy
 check("shared policy rejects downgrades and divergence", transitionPolicy.includes('merge-base --is-ancestor "$current_sha" "$candidate_sha"'));
 check("shared policy protects blocked infrastructure", transitionPolicy.includes("infra/Dockerfile") && transitionPolicy.includes("data/learning-competencies.json"));
 check("shared policy protects migration history", transitionPolicy.includes("Existing migrations are immutable") && transitionPolicy.includes("contains a destructive or structural statement"));
+const expectedProtectedControlPlanePaths = [
+  ".dockerignore",
+  ".github/workflows/ci.yml",
+  ".github/workflows/deploy-production.yml",
+  "scripts/deploy-production.sh",
+  "scripts/github-actions-deploy-entrypoint.sh",
+  "scripts/lib/production-transition-policy.sh",
+  "scripts/lib/compose-env-guard.sh",
+  "scripts/lib/release-worktree-integrity.sh",
+  "scripts/prepare-release-env.sh",
+  "scripts/validate-production-transition.sh",
+  "scripts/validate-production-deploy-readiness.mjs",
+  "scripts/validate-runtime-env.mjs",
+  "src/app/api/version/route.ts",
+  "src/app/api/ready/route.ts",
+  "src/lib/db/pool.ts",
+  "scripts/postgres",
+  "infra/postgres/schema.sql",
+  "infra/postgres/baseline.sha256",
+];
+const protectedControlPlaneBlock = transitionPolicy.match(
+  /^readonly -a PRODUCTION_TRANSITION_PROTECTED_CONTROL_PLANE=\(\r?\n(?<entries>[\s\S]*?)\r?\n\)$/m,
+)?.groups?.entries;
+const actualProtectedControlPlanePaths = protectedControlPlaneBlock
+  ? [...protectedControlPlaneBlock.matchAll(/^\s*"([^"]+)",?\r?$/gm)].map((match) => match[1])
+  : [];
 check(
   "shared policy protects the production control-plane",
-  [
-    ".dockerignore",
-    ".github/workflows/ci.yml",
-    ".github/workflows/deploy-production.yml",
-    "scripts/deploy-production.sh",
-    "scripts/github-actions-deploy-entrypoint.sh",
-    "scripts/lib/production-transition-policy.sh",
-    "scripts/lib/compose-env-guard.sh",
-    "scripts/lib/release-worktree-integrity.sh",
-    "scripts/prepare-release-env.sh",
-    "scripts/validate-production-transition.sh",
-    "scripts/validate-production-deploy-readiness.mjs",
-    "scripts/postgres",
-    "infra/postgres/schema.sql",
-    "infra/postgres/baseline.sha256",
-  ].every((entry) => transitionPolicy.includes(`"${entry}"`))
+  actualProtectedControlPlanePaths.length === expectedProtectedControlPlanePaths.length
+    && actualProtectedControlPlanePaths.every((entry, index) => entry === expectedProtectedControlPlanePaths[index])
     && transitionPolicy.includes('PRODUCTION_TRANSITION_GITATTRIBUTES_PATHSPEC=":(glob)**/.gitattributes"')
     && transitionPolicy.includes('"$PRODUCTION_TRANSITION_GITATTRIBUTES_PATHSPEC"')
     && transitionPolicy.includes("protected production control-plane"),
