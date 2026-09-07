@@ -123,7 +123,7 @@
     "@types/react": "^19.0.12",
     "@types/react-dom": "^19.2.4",
     "eslint": "^9.24.0",
-    "eslint-config-next": "15.5.25",
+    "eslint-config-next": "16.3.4",
     "knip": "6.34.0",
     "postcss": "^8.5.26",
     "tailwindcss": "^3.4.17",
