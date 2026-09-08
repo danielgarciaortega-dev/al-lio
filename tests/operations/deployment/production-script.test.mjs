@@ -331,6 +331,9 @@ docker() {
     printf 'pg_restore=called\\n' >> "$TRACE"
   fi
 }
+assert_postgres_identity() {
+  postgres_container_id="$POSTGRES_CONTAINER"
+}
 ${validator}
 ${flow}
 printf 'validated_checksum=%s\\n' "$postgres_backup_checksum" >> "$TRACE"
@@ -423,6 +426,9 @@ docker() {
   else
     printf 'docker=%s\\n' "$*" >> "$TRACE"
   fi
+}
+assert_postgres_identity() {
+  postgres_container_id="$POSTGRES_CONTAINER"
 }
 ${validator}
 ${flow}
