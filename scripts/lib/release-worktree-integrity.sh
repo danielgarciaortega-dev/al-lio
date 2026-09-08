@@ -97,13 +97,20 @@ read_release_git_metadata_line() {
   local metadata_label="$2"
   local metadata_size=""
   local byte_dump=""
+  local trusted_utility=""
 
   release_git_metadata_line=""
+  for trusted_utility in /usr/bin/stat /usr/bin/od /usr/bin/awk; do
+    [[ -x "$trusted_utility" ]] || {
+      release_worktree_integrity_error="Required trusted filesystem utility is unavailable: $trusted_utility"
+      return 1
+    }
+  done
   [[ -f "$metadata_path" && ! -L "$metadata_path" ]] || {
     release_worktree_integrity_error="$metadata_label must be a regular non-symlink file: $metadata_path"
     return 1
   }
-  metadata_size="$(stat -c '%s' -- "$metadata_path" 2>/dev/null)" || {
+  metadata_size="$(/usr/bin/stat -c '%s' -- "$metadata_path" 2>/dev/null)" || {
     release_worktree_integrity_error="Cannot inspect $metadata_label size: $metadata_path"
     return 1
   }
@@ -113,11 +120,11 @@ read_release_git_metadata_line() {
     return 1
   }
 
-  byte_dump="$(LC_ALL=C od -An -v -tu1 -- "$metadata_path" 2>/dev/null)" || {
+  byte_dump="$(LC_ALL=C /usr/bin/od -An -v -tu1 -- "$metadata_path" 2>/dev/null)" || {
     release_worktree_integrity_error="Cannot read raw $metadata_label bytes: $metadata_path"
     return 1
   }
-  LC_ALL=C awk '
+  LC_ALL=C /usr/bin/awk '
     BEGIN { bytes = 0; line_feeds = 0; last = -1; valid = 1 }
     {
       for (field = 1; field <= NF; field++) {
@@ -142,7 +149,7 @@ read_release_git_metadata_line() {
     return 1
   }
 
-  IFS= read -r release_git_metadata_line < "$metadata_path" || {
+  IFS= builtin read -r release_git_metadata_line < "$metadata_path" || {
     release_worktree_integrity_error="Cannot parse $metadata_label: $metadata_path"
     return 1
   }
@@ -165,7 +172,7 @@ normalize_release_absolute_path() {
     windows_path="$(/usr/bin/cygpath -w -- "$normalized_path")" || return 1
     /usr/bin/cygpath -u -- "$windows_path"
   else
-    printf '%s\n' "$normalized_path"
+    builtin printf '%s\n' "$normalized_path"
   fi
 }
 
@@ -190,8 +197,15 @@ validate_release_gitfile_linkage() {
   local linked_commondir=""
   local backpointer_value=""
   local linked_backpointer=""
+  local trusted_utility=""
 
   release_worktree_integrity_error=""
+  for trusted_utility in /usr/bin/stat /usr/bin/id /usr/bin/readlink; do
+    [[ -x "$trusted_utility" ]] || {
+      release_worktree_integrity_error="Required trusted filesystem utility is unavailable: $trusted_utility"
+      return 1
+    }
+  done
   repository_dir="$(normalize_release_absolute_path "$1")" || {
     release_worktree_integrity_error="Canonical repository path must be absolute: $1"
     return 1
@@ -213,7 +227,7 @@ validate_release_gitfile_linkage() {
   }
   for canonical_path in "$repository_dir" "$repository_git_dir" "$worktrees_dir" "$release_dir"; do
     [[ -d "$canonical_path" && ! -L "$canonical_path" &&
-      "$(readlink -f -- "$canonical_path" 2>/dev/null)" == "$canonical_path" ]] || {
+      "$(/usr/bin/readlink -f -- "$canonical_path" 2>/dev/null)" == "$canonical_path" ]] || {
       release_worktree_integrity_error="Required directory is unavailable, non-canonical, or traverses a symlink: $canonical_path"
       return 1
     }
@@ -223,27 +237,27 @@ validate_release_gitfile_linkage() {
     release_worktree_integrity_error="Release .git must be a regular non-symlink file: $release_gitfile"
     return 1
   }
-  actual_mode="$(stat -c '%a' -- "$release_gitfile" 2>/dev/null)" || {
+  actual_mode="$(/usr/bin/stat -c '%a' -- "$release_gitfile" 2>/dev/null)" || {
     release_worktree_integrity_error="Cannot inspect release .git mode: $release_gitfile"
     return 1
   }
-  actual_owner="$(stat -c '%u' -- "$release_gitfile" 2>/dev/null)" || {
+  actual_owner="$(/usr/bin/stat -c '%u' -- "$release_gitfile" 2>/dev/null)" || {
     release_worktree_integrity_error="Cannot inspect release .git owner: $release_gitfile"
     return 1
   }
-  actual_group="$(stat -c '%g' -- "$release_gitfile" 2>/dev/null)" || {
+  actual_group="$(/usr/bin/stat -c '%g' -- "$release_gitfile" 2>/dev/null)" || {
     release_worktree_integrity_error="Cannot inspect release .git group: $release_gitfile"
     return 1
   }
-  actual_links="$(stat -c '%h' -- "$release_gitfile" 2>/dev/null)" || {
+  actual_links="$(/usr/bin/stat -c '%h' -- "$release_gitfile" 2>/dev/null)" || {
     release_worktree_integrity_error="Cannot inspect release .git link count: $release_gitfile"
     return 1
   }
-  expected_owner="$(id -u)" || {
+  expected_owner="$(/usr/bin/id -u)" || {
     release_worktree_integrity_error="Cannot determine the expected release .git owner."
     return 1
   }
-  expected_group="$(id -g)" || {
+  expected_group="$(/usr/bin/id -g)" || {
     release_worktree_integrity_error="Cannot determine the expected release .git group."
     return 1
   }
@@ -269,7 +283,7 @@ validate_release_gitfile_linkage() {
     return 1
   }
   [[ -d "$linked_git_dir" && ! -L "$linked_git_dir" &&
-    "$(readlink -f -- "$linked_git_dir" 2>/dev/null)" == "$linked_git_dir" ]] || {
+    "$(/usr/bin/readlink -f -- "$linked_git_dir" 2>/dev/null)" == "$linked_git_dir" ]] || {
     release_worktree_integrity_error="Release gitdir target is unavailable, non-canonical, or traverses a symlink: $linked_git_dir"
     return 1
   }
@@ -290,7 +304,7 @@ validate_release_gitfile_linkage() {
   else
     linked_commondir="$linked_git_dir/$commondir_value"
   fi
-  linked_commondir="$(readlink -f -- "$linked_commondir" 2>/dev/null)" || {
+  linked_commondir="$(/usr/bin/readlink -f -- "$linked_commondir" 2>/dev/null)" || {
     release_worktree_integrity_error="Cannot resolve linked commondir: $linked_git_dir/commondir"
     return 1
   }
@@ -305,7 +319,7 @@ validate_release_gitfile_linkage() {
     release_worktree_integrity_error="Linked gitdir backpointer must be absolute: $backpointer_value"
     return 1
   }
-  [[ "$(readlink -f -- "$linked_backpointer" 2>/dev/null)" == "$release_gitfile" &&
+  [[ "$(/usr/bin/readlink -f -- "$linked_backpointer" 2>/dev/null)" == "$release_gitfile" &&
     "$linked_backpointer" == "$release_gitfile" ]] || {
     release_worktree_integrity_error="Linked gitdir backpointer does not identify the release .git file: $linked_backpointer"
     return 1
