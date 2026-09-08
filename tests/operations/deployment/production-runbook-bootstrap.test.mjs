@@ -1,5 +1,6 @@
-// The exceptional runbook is executed manually against production, so this
-// test protects the trust-bootstrap ordering without executing VPS mutations.
+// Source-level assertion rationale: the exceptional runbook is executed manually against
+// production, so executing the real boundary here would mutate VPS state. This test
+// protects the trust-bootstrap ordering without executing production mutations.
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
