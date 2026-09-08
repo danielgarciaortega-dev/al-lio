@@ -276,6 +276,7 @@ ${validationScript(fixture.commitSha)}`,
   }
 });
 
+// Source-level assertion rationale: executing the real boundary proves allowed behavior, but cannot prove a forbidden `git -C` call is absent from every trusted-boundary path; this narrow source assertion enforces that negative invariant.
 test("the trusted commit boundary never executes Git against release-local state", async () => {
   const source = await readFile(integrityHelperUrl, "utf8");
   const boundaryStart = source.indexOf("trusted_git() {");
