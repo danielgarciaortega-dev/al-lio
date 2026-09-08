@@ -493,7 +493,8 @@ above all pass. Any other relevant difference is a hard stop for manual review.
 
 Create a detached release worktree while leaving the canonical checkout in
 place. Restore the private umask after Git creates the readable application
-tree.
+tree. The integrity helper is loaded from the exact candidate Git blob, never
+from the newly created worktree before that worktree has been validated.
 
 ```bash
 [[ ! -e "$AL_LIO_RELEASE_DIR" ]]
@@ -505,7 +506,64 @@ git -C "$AL_LIO_REPOSITORY_DIR" worktree add --detach \
 umask "$AL_LIO_PRIVATE_UMASK"
 
 [[ "$(git -C "$AL_LIO_RELEASE_DIR" rev-parse HEAD)" == "$AL_LIO_RELEASE_SHA" ]]
-source "$AL_LIO_RELEASE_DIR/scripts/lib/release-worktree-integrity.sh"
+
+AL_LIO_CANDIDATE_INTEGRITY_METADATA=""
+AL_LIO_CANDIDATE_INTEGRITY_PATH=""
+IFS=$'\t' read -r AL_LIO_CANDIDATE_INTEGRITY_METADATA AL_LIO_CANDIDATE_INTEGRITY_PATH < <(
+  git -C "$AL_LIO_REPOSITORY_DIR" ls-tree "$AL_LIO_RELEASE_SHA" -- \
+    scripts/lib/release-worktree-integrity.sh
+)
+read -r AL_LIO_CANDIDATE_INTEGRITY_MODE AL_LIO_CANDIDATE_INTEGRITY_TYPE \
+  AL_LIO_CANDIDATE_INTEGRITY_OBJECT <<< "$AL_LIO_CANDIDATE_INTEGRITY_METADATA"
+[[ "$AL_LIO_CANDIDATE_INTEGRITY_PATH" == scripts/lib/release-worktree-integrity.sh &&
+  "$AL_LIO_CANDIDATE_INTEGRITY_MODE" == 100644 &&
+  "$AL_LIO_CANDIDATE_INTEGRITY_TYPE" == blob &&
+  "$AL_LIO_CANDIDATE_INTEGRITY_OBJECT" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || {
+  printf 'ERROR: candidate release-worktree integrity helper is not an exact 100644 blob.\n' >&2
+  exit 1
+}
+
+AL_LIO_CANDIDATE_INTEGRITY_DIR="$(
+  mktemp -d "$AL_LIO_BACKUP_DIR/.candidate-integrity.XXXXXX"
+)"
+AL_LIO_CANDIDATE_INTEGRITY_HELPER="$AL_LIO_CANDIDATE_INTEGRITY_DIR/release-worktree-integrity.sh"
+cleanup_candidate_integrity_helper() {
+  local cleanup_failed=0
+  if [[ -e "${AL_LIO_CANDIDATE_INTEGRITY_HELPER:-}" ||
+    -L "${AL_LIO_CANDIDATE_INTEGRITY_HELPER:-}" ]]; then
+    rm -f -- "$AL_LIO_CANDIDATE_INTEGRITY_HELPER" || cleanup_failed=1
+  fi
+  if [[ -d "${AL_LIO_CANDIDATE_INTEGRITY_DIR:-}" ]]; then
+    rmdir -- "$AL_LIO_CANDIDATE_INTEGRITY_DIR" || cleanup_failed=1
+  fi
+  [[ "$cleanup_failed" -eq 0 ]] || {
+    printf 'ERROR: private candidate integrity directory cleanup failed.\n' >&2
+    return 1
+  }
+}
+
+if ! chmod 700 "$AL_LIO_CANDIDATE_INTEGRITY_DIR" ||
+  ! git -C "$AL_LIO_REPOSITORY_DIR" cat-file blob \
+    "$AL_LIO_CANDIDATE_INTEGRITY_OBJECT" > "$AL_LIO_CANDIDATE_INTEGRITY_HELPER" ||
+  ! chmod 600 "$AL_LIO_CANDIDATE_INTEGRITY_HELPER" ||
+  [[ "$(git hash-object --no-filters "$AL_LIO_CANDIDATE_INTEGRITY_HELPER")" != \
+    "$AL_LIO_CANDIDATE_INTEGRITY_OBJECT" ]]; then
+  printf 'ERROR: exact candidate integrity helper could not be materialized.\n' >&2
+  cleanup_candidate_integrity_helper || exit 1
+  exit 1
+fi
+if ! source "$AL_LIO_CANDIDATE_INTEGRITY_HELPER"; then
+  printf 'ERROR: exact candidate integrity helper could not be loaded.\n' >&2
+  cleanup_candidate_integrity_helper || exit 1
+  exit 1
+fi
+cleanup_candidate_integrity_helper || exit 1
+unset AL_LIO_CANDIDATE_INTEGRITY_METADATA AL_LIO_CANDIDATE_INTEGRITY_PATH \
+  AL_LIO_CANDIDATE_INTEGRITY_MODE AL_LIO_CANDIDATE_INTEGRITY_TYPE \
+  AL_LIO_CANDIDATE_INTEGRITY_OBJECT AL_LIO_CANDIDATE_INTEGRITY_HELPER \
+  AL_LIO_CANDIDATE_INTEGRITY_DIR
+unset -f cleanup_candidate_integrity_helper
+
 validate_release_worktree_integrity "$AL_LIO_RELEASE_DIR" "$AL_LIO_RELEASE_SHA" || {
   printf 'ERROR: %s\n' "$release_worktree_integrity_error" >&2
   exit 1
@@ -1075,7 +1133,7 @@ while IFS= read -r AL_LIO_RECORD_LINE || [[ -n "$AL_LIO_RECORD_LINE" ]]; do
   AL_LIO_RECORD_KEY="${BASH_REMATCH[1]}"
   AL_LIO_RECORD_VALUE="${BASH_REMATCH[2]}"
   [[ "$AL_LIO_RECORD_VALUE" =~ ^[[:print:]]*$ ]] || {
-    printf 'ERROR: release-record value contains non-printable data.\n' >&2
+    printf 'ERROR: release-record value contains non-printable data.\n' "$label" >&2
     exit 1
   }
   case "$AL_LIO_RECORD_KEY" in
