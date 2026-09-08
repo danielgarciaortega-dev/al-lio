@@ -225,6 +225,28 @@ container_health() {
   docker inspect "$1" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
 }
 
+assert_preserved_container_identity() {
+  local container_name="$1"
+  local expected_id="$2"
+  local label="$3"
+  local phase="$4"
+  local actual_id=""
+
+  [[ -n "$expected_id" ]] || fail "$label container identity was not captured before $phase."
+  actual_id="$(docker inspect "$container_name" --format '{{.Id}}' 2>/dev/null || true)"
+  [[ -n "$actual_id" ]] || fail "$label container is unavailable before $phase."
+  [[ "$actual_id" == "$expected_id" ]] ||
+    fail "$label container identity changed before $phase."
+}
+
+assert_postgres_identity() {
+  assert_preserved_container_identity "$POSTGRES_CONTAINER" "$postgres_container_id" "PostgreSQL" "$1"
+}
+
+assert_radar_identity() {
+  assert_preserved_container_identity "$RADAR_CONTAINER" "$radar_container_id" "Radar" "$1"
+}
+
 wait_for_web_health() {
   local attempt=0
   local state=""
@@ -246,15 +268,24 @@ wait_for_web_health() {
 }
 
 drop_rehearsal_database() {
+  local current_postgres_id=""
+
   if [[ -n "$rehearsal_database" ]]; then
-    docker exec "$POSTGRES_CONTAINER" dropdb -U al_lio --if-exists "$rehearsal_database" >/dev/null 2>&1 || true
+    current_postgres_id="$(docker inspect "$POSTGRES_CONTAINER" --format '{{.Id}}' 2>/dev/null || true)"
+    if [[ -n "$postgres_container_id" && "$current_postgres_id" == "$postgres_container_id" ]]; then
+      docker exec "$postgres_container_id" dropdb -U al_lio --if-exists "$rehearsal_database" >/dev/null 2>&1 || true
+    fi
     rehearsal_database=""
   fi
 }
 
 restart_preserved_radar() {
+  local current_radar_id=""
+
   if [[ "$radar_stopped" -eq 1 ]]; then
-    docker start "$RADAR_CONTAINER" >/dev/null || return 1
+    current_radar_id="$(docker inspect "$RADAR_CONTAINER" --format '{{.Id}}' 2>/dev/null || true)"
+    [[ -n "$radar_container_id" && "$current_radar_id" == "$radar_container_id" ]] || return 1
+    docker start "$radar_container_id" >/dev/null || return 1
     radar_stopped=0
   fi
 }
@@ -438,14 +469,18 @@ printf '%s\n' "$previous_web_image" > "$backup_dir/previous-web-image-$release_s
 docker inspect "$RADAR_CONTAINER" --format '{{.Config.Image}}' > "$backup_dir/previous-radar-image-$release_started_at.txt"
 postgres_container_id="$(docker inspect "$POSTGRES_CONTAINER" --format '{{.Id}}')"
 radar_container_id="$(docker inspect "$RADAR_CONTAINER" --format '{{.Id}}')"
+[[ -n "$postgres_container_id" && -n "$radar_container_id" ]] ||
+  fail "Could not capture preserved PostgreSQL/Radar container identities."
 
 log "Building candidate image without stopping production"
 "${compose[@]}" build --pull al_lio_web
 docker image inspect "al-lio-web:$release_sha" >/dev/null
 
 log "Auditing production migration state with the candidate image"
+assert_postgres_identity "candidate migration baseline audit"
 audit_output="$("${compose[@]}" --profile ops run --rm -T al_lio_migrator node scripts/postgres/audit-baseline.mjs </dev/null)"
 printf '%s\n' "$audit_output"
+assert_postgres_identity "candidate migration status inspection"
 migration_status_output="$("${compose[@]}" --profile ops run --rm -T al_lio_migrator node scripts/postgres/migrate.mjs --status </dev/null)"
 printf '%s\n' "$migration_status_output"
 
@@ -458,18 +493,24 @@ fi
 
 if [[ "$migration_required" -eq 1 ]]; then
   log "Creating and restore-testing the PostgreSQL backup"
+  assert_postgres_identity "production backup"
   backup_output="$(
-    AL_LIO_BACKUP_DIR="$backup_dir" bash "$release_dir/scripts/postgres/backup-production.sh"
+    AL_LIO_POSTGRES_CONTAINER="$postgres_container_id" \
+      AL_LIO_BACKUP_DIR="$backup_dir" \
+      bash "$release_dir/scripts/postgres/backup-production.sh"
   )"
   printf '%s\n' "$backup_output"
   validate_postgres_backup_output "$backup_output"
-  bash "$release_dir/scripts/postgres/verify-backup-production.sh" "$postgres_backup_file"
+  assert_postgres_identity "backup restore verification"
+  AL_LIO_POSTGRES_CONTAINER="$postgres_container_id" \
+    bash "$release_dir/scripts/postgres/verify-backup-production.sh" "$postgres_backup_file"
   restore_verification_result="passed"
 
   log "Rehearsing all pending migrations on an isolated restored database"
+  assert_postgres_identity "migration rehearsal database creation"
   rehearsal_database="al_lio_rehearsal_${release_short_sha}_$$"
-  docker exec "$POSTGRES_CONTAINER" createdb -U al_lio "$rehearsal_database"
-  docker exec -i "$POSTGRES_CONTAINER" pg_restore \
+  docker exec "$postgres_container_id" createdb -U al_lio "$rehearsal_database"
+  docker exec -i "$postgres_container_id" pg_restore \
     -U al_lio \
     -d "$rehearsal_database" \
     --exit-on-error \
@@ -484,6 +525,7 @@ if [[ "$migration_required" -eq 1 ]]; then
   fi
   [[ "$migration_url_without_query" == */* ]] || fail "DATABASE_MIGRATION_URL is not a PostgreSQL URL."
   export DATABASE_MIGRATION_URL="${migration_url_without_query%/*}/${rehearsal_database}${migration_url_query}"
+  assert_postgres_identity "migration rehearsal"
   "${compose[@]}" --profile ops run --rm -T -e DATABASE_MIGRATION_URL al_lio_migrator </dev/null
   unset DATABASE_MIGRATION_URL
 
@@ -493,13 +535,15 @@ if [[ "$migration_required" -eq 1 ]]; then
   # always off by one as soon as a real pending migration is rehearsed.
   migration_file_count="$(find "$release_dir/infra/postgres/migrations" -maxdepth 1 -type f -name '*.sql' | wc -l | tr -d '[:space:]')"
   expected_migration_count="$((migration_file_count + 1))"
-  rehearsal_migration_count="$(docker exec "$POSTGRES_CONTAINER" psql -U al_lio -d "$rehearsal_database" -Atc 'select count(*) from public.schema_migrations;')"
+  assert_postgres_identity "migration rehearsal ledger verification"
+  rehearsal_migration_count="$(docker exec "$postgres_container_id" psql -U al_lio -d "$rehearsal_database" -Atc 'select count(*) from public.schema_migrations;')"
   [[ "$rehearsal_migration_count" == "$expected_migration_count" ]] || fail "Migration rehearsal ended with $rehearsal_migration_count/$expected_migration_count migrations."
   rehearsal_result="passed"
   drop_rehearsal_database
 
   log "Stopping and backing up the preserved Radar writer"
-  docker stop --time 30 "$RADAR_CONTAINER" >/dev/null
+  assert_radar_identity "Radar writer stop"
+  docker stop --time 30 "$radar_container_id" >/dev/null
   radar_stopped=1
   radar_backup_file="$backup_dir/radar-data-$release_started_at.tgz"
   docker run --rm \
@@ -515,9 +559,14 @@ if [[ "$migration_required" -eq 1 ]]; then
   radar_backup_status="verified"
 
   log "Applying rehearsed migrations to production"
+  assert_postgres_identity "production migration baseline audit"
+  assert_radar_identity "production migration baseline audit"
   "${compose[@]}" --profile ops run --rm -T al_lio_migrator node scripts/postgres/audit-baseline.mjs </dev/null
+  assert_postgres_identity "production migrations"
+  assert_radar_identity "production migrations"
   "${compose[@]}" --profile ops run --rm -T al_lio_migrator </dev/null
-  production_migration_count="$(docker exec "$POSTGRES_CONTAINER" psql -U al_lio -d al_lio -Atc 'select count(*) from public.schema_migrations;')"
+  assert_postgres_identity "production migration ledger verification"
+  production_migration_count="$(docker exec "$postgres_container_id" psql -U al_lio -d al_lio -Atc 'select count(*) from public.schema_migrations;')"
   [[ "$production_migration_count" == "$expected_migration_count" ]] || fail "Production ended with $production_migration_count/$expected_migration_count migrations."
   applied_migration_ids="$pending_migration_ids"
 fi
@@ -529,6 +578,8 @@ log "Replacing only the web service"
   fail "Candidate AL_LIO_RELEASE_SHA changed before cutover."
 validate_release_worktree_integrity "$release_dir" "$release_sha" ||
   fail "Candidate integrity check failed before cutover: $release_worktree_integrity_error"
+assert_postgres_identity "web cutover"
+assert_radar_identity "web cutover"
 web_replacement_started=1
 "${compose[@]}" up -d --no-deps al_lio_web </dev/null
 
@@ -555,15 +606,16 @@ unauthenticated_radar_status="$(curl -sS --connect-timeout 5 --max-time 20 -o /d
 [[ "$unauthenticated_radar_status" == "401" ]] || fail "Unauthenticated /api/job-radar returned HTTP $unauthenticated_radar_status instead of 401."
 automated_smoke_result="passed"
 
-[[ "$(docker inspect "$POSTGRES_CONTAINER" --format '{{.Id}}')" == "$postgres_container_id" ]] || fail "PostgreSQL container identity changed unexpectedly."
+assert_postgres_identity "final preservation verification"
 postgres_container_preserved="true"
-[[ "$(docker inspect "$RADAR_CONTAINER" --format '{{.Id}}')" == "$radar_container_id" ]] || fail "Radar container identity changed unexpectedly."
+assert_radar_identity "final preservation verification"
 radar_container_preserved="true"
 
 if [[ "$radar_stopped" -eq 1 ]]; then
   restart_preserved_radar || fail "Radar could not be restarted after the web became healthy."
 fi
-[[ "$(container_status "$RADAR_CONTAINER")" == "running" ]] || fail "Radar is not running after deployment."
+assert_radar_identity "post-deployment Radar status verification"
+[[ "$(container_status "$radar_container_id")" == "running" ]] || fail "Radar is not running after deployment."
 
 write_release_record "approved"
 
