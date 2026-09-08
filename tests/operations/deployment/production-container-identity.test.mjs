@@ -1,4 +1,5 @@
-// Production container replacement is an external race, so these tests protect
+// Source-level assertion rationale: production container replacement is an external race,
+// and executing the real deployment boundary would mutate production. These tests protect
 // both the fail-closed identity primitive and its placement before every
 // identity-sensitive deployment boundary.
 import assert from "node:assert/strict";
