@@ -86,7 +86,7 @@ test("the forced SSH command exposes only the guarded deployment operation", asy
   assert.doesNotMatch(entrypoint, /\beval\b/);
 });
 
-test("the forced SSH command bootstraps the deploy controller from immutable main-reachable Git blobs", async () => {
+test("the forced SSH command bootstraps the deploy controller from hardened immutable Git blobs", async () => {
   const entrypoint = await readFile(entrypointUrl, "utf8");
   const expectedControllerFiles = [
     "scripts/deploy-production.sh:100755",
@@ -97,22 +97,40 @@ test("the forced SSH command bootstraps the deploy controller from immutable mai
   ];
 
   for (const entry of expectedControllerFiles) assert.ok(entrypoint.includes(`"${entry}"`), entry);
-  assert.match(entrypoint, /git -C "\$repository_dir" fetch --tags origin main/);
+  assert.match(entrypoint, /CANONICAL_REPOSITORY_URL="https:\/\/github\.com\/danielgarciaortega-dev\/al-lio\.git"/);
+  assert.match(entrypoint, /GIT_NO_REPLACE_OBJECTS=1/);
+  assert.match(entrypoint, /GIT_GRAFT_FILE=\/dev\/null/);
+  assert.match(entrypoint, /GIT_CONFIG_NOSYSTEM=1/);
+  assert.match(entrypoint, /GIT_CONFIG_GLOBAL=\/dev\/null/);
+  assert.match(entrypoint, /GIT_ATTR_NOSYSTEM=1/);
+  assert.match(entrypoint, /GIT_TERMINAL_PROMPT=0/);
+  assert.match(entrypoint, /GIT_CONFIG_KEY_0=core\.hooksPath/);
+  assert.match(entrypoint, /GIT_CONFIG_KEY_1=core\.fsmonitor/);
+  assert.match(entrypoint, /GIT_CONFIG_KEY_2=remote\.origin\.url/);
+  assert.match(entrypoint, /GIT_CONFIG_KEY_3=protocol\.ext\.allow/);
+  assert.match(entrypoint, /GIT_CONFIG_KEY_4=protocol\.file\.allow/);
+  assert.match(entrypoint, /GIT_CONFIG_KEY_5=credential\.helper/);
+  assert.match(entrypoint, /validate_repository_git_metadata/);
+  assert.match(entrypoint, /fetch --tags origin[\s\\\n]+"?\+refs\/heads\/main:refs\/remotes\/origin\/main"?/);
   assert.match(entrypoint, /cat-file -e "\$\{release_sha\}\^\{commit\}"/);
   assert.match(entrypoint, /merge-base --is-ancestor "\$release_sha" origin\/main/);
   assert.match(entrypoint, /ls-tree "\$release_sha" -- "\$path"/);
   assert.match(entrypoint, /cat-file blob "\$object" > "\$target_path"/);
-  assert.match(entrypoint, /git hash-object "\$target_path"/);
+  assert.match(entrypoint, /git hash-object --no-filters "\$target_path"/);
   assert.match(entrypoint, /mktemp -d .*al-lio-deploy-controller/);
   assert.doesNotMatch(entrypoint, /cd "\$release_dir"/);
 
+  const hardenIndex = entrypoint.indexOf("harden_git_environment");
+  const metadataIndex = entrypoint.indexOf("validate_repository_git_metadata");
   const materializeIndex = entrypoint.indexOf('materialize_controller_file "$controller_path" "$controller_mode"');
   const executeIndex = entrypoint.indexOf('./scripts/deploy-production.sh "$release_sha"');
-  assert.ok(materializeIndex >= 0 && executeIndex > materializeIndex);
+  assert.ok(hardenIndex >= 0 && metadataIndex > hardenIndex);
+  assert.ok(materializeIndex > metadataIndex && executeIndex > materializeIndex);
 });
 
-test("a mutable checkout cannot replace the controller blob selected by the forced SSH bootstrap", async () => {
+test("mutable checkout bytes and local replace refs cannot substitute the controller blob", async () => {
   const entrypoint = await readFile(entrypointUrl, "utf8");
+  const hardenFunction = extractShellFunction(entrypoint, "harden_git_environment");
   const materializeFunction = extractShellFunction(entrypoint, "materialize_controller_file");
   const root = await mkdtemp(join(tmpdir(), "al-lio-controller-bootstrap-"));
   const repository = join(root, "repository");
@@ -136,16 +154,25 @@ test("a mutable checkout cannot replace the controller blob selected by the forc
     run("git", ["-C", repository, "update-index", "--chmod=+x", "scripts/deploy-production.sh"]);
     run("git", ["-C", repository, "commit", "-q", "-m", "trusted controller"]);
     const releaseSha = run("git", ["-C", repository, "rev-parse", "HEAD"]);
+    const trustedBlob = run("git", ["-C", repository, "rev-parse", `${releaseSha}:scripts/deploy-production.sh`]);
 
-    // Mutate the checkout after the commit. The bootstrap must still select the
-    // exact tree blob, never these mutable working-tree bytes.
+    run("git", ["-C", repository, "switch", "-q", "-c", "hostile-controller"]);
     await writeFile(
       deployPath,
       '#!/usr/bin/env bash\nprintf hostile > "$HOSTILE_SENTINEL"\n',
       "utf8",
     );
+    run("git", ["-C", repository, "add", "scripts/deploy-production.sh"]);
+    run("git", ["-C", repository, "commit", "-q", "-m", "hostile controller"]);
+    const hostileSha = run("git", ["-C", repository, "rev-parse", "HEAD"]);
+    const hostileBlob = run("git", ["-C", repository, "rev-parse", `${hostileSha}:scripts/deploy-production.sh`]);
+    assert.notEqual(hostileBlob, trustedBlob);
 
-    const harness = `set -Eeuo pipefail\n${materializeFunction}\nfail() { printf 'ERROR: %s\\n' "$*" >&2; exit 1; }\nrepository_dir="${toBashPath(repository)}"\nrelease_sha="${releaseSha}"\ncontroller_dir="${toBashPath(controller)}"\nmkdir -p "$controller_dir"\nmaterialize_controller_file scripts/deploy-production.sh 100755\nTRUSTED_SENTINEL="${toBashPath(trustedSentinel)}" HOSTILE_SENTINEL="${toBashPath(hostileSentinel)}" "$controller_dir/scripts/deploy-production.sh"\n`;
+    run("git", ["-C", repository, "replace", releaseSha, hostileSha]);
+    const replacedBlob = run("git", ["-C", repository, "rev-parse", `${releaseSha}:scripts/deploy-production.sh`]);
+    assert.equal(replacedBlob, hostileBlob, "fixture must prove the local replace ref can redirect Git by default");
+
+    const harness = `set -Eeuo pipefail\nCANONICAL_REPOSITORY_URL=https://github.com/danielgarciaortega-dev/al-lio.git\n${hardenFunction}\n${materializeFunction}\nfail() { printf 'ERROR: %s\\n' "$*" >&2; exit 1; }\nrepository_dir="${toBashPath(repository)}"\nrelease_sha="${releaseSha}"\ncontroller_dir="${toBashPath(controller)}"\nmkdir -p "$controller_dir"\nharden_git_environment\nmaterialize_controller_file scripts/deploy-production.sh 100755\nTRUSTED_SENTINEL="${toBashPath(trustedSentinel)}" HOSTILE_SENTINEL="${toBashPath(hostileSentinel)}" "$controller_dir/scripts/deploy-production.sh"\n`;
     const result = spawnSync(bashPath, ["-s"], { encoding: "utf8", input: harness });
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assert.equal(await readFile(trustedSentinel, "utf8"), "trusted");
