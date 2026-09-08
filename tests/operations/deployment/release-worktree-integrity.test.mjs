@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdtemp,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -72,6 +81,73 @@ else
   printf 'rejected=%s\\n' "$release_worktree_integrity_error" >&2
   exit 1
 fi`;
+}
+
+async function createReleaseGitfileFixture(root) {
+  const canonical = await createRepository(root, "canonical", "trusted\n");
+  const release = join(root, "release");
+  git(canonical.repository, [
+    "worktree",
+    "add",
+    "--quiet",
+    "--detach",
+    release,
+    canonical.commitSha,
+  ]);
+  const gitfile = join(release, ".git");
+  const gitfileContents = await readFile(gitfile, "utf8");
+  const rawGitdir = gitfileContents.slice("gitdir: ".length, -1);
+  return {
+    ...canonical,
+    release,
+    gitfile,
+    linkedGitdir: rawGitdir.replaceAll("/", process.platform === "win32" ? "\\" : "/"),
+  };
+}
+
+async function runGitfileValidation(fixture, setup = "") {
+  return runHelper(
+    fixture.repository,
+    `${setup}
+RELEASE="${toBashPath(fixture.release)}"
+if validate_release_gitfile_linkage "$REPOSITORY" "$RELEASE"; then
+  printf 'accepted\\n'
+else
+  printf 'rejected=%s\\n' "$release_worktree_integrity_error" >&2
+  exit 1
+fi`,
+  );
+}
+
+async function expectGitfileRejection(fixture, expectedError, setup = "") {
+  const result = await runGitfileValidation(fixture, setup);
+  assert.notEqual(result.status, 0, "hostile gitfile linkage unexpectedly passed");
+  assert.match(result.stderr, expectedError);
+}
+
+async function writeGitfileTarget(fixture, target) {
+  await rm(fixture.gitfile);
+  await writeFile(fixture.gitfile, `gitdir: ${target}\n`, "utf8");
+}
+
+async function replaceGitfile(fixture, contents) {
+  await rm(fixture.gitfile);
+  await writeFile(fixture.gitfile, contents);
+}
+
+async function createFileSymlink(target, path) {
+  try {
+    await symlink(target, path, "file");
+  } catch (error) {
+    if (process.platform !== "win32" || error.code !== "EPERM") throw error;
+    const quote = (value) => `'${toBashPath(value).replaceAll("'", "'\\''")}'`;
+    const result = spawnSync(bashPath, ["-lc", `ln -s -- ${quote(target)} ${quote(path)}`], {
+      encoding: "utf8",
+      env: { ...process.env, MSYS: "winsymlinks:sys" },
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+  }
 }
 
 test("canonical commit identity accepts only an exact lowercase commit SHA", async (t) => {
@@ -274,6 +350,190 @@ ${validationScript(fixture.commitSha)}`,
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("release gitfile linkage accepts a valid detached worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-valid-"));
+  try {
+    const fixture = await createReleaseGitfileFixture(root);
+    const result = await runGitfileValidation(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "accepted\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("release .git must be a single regular file with strict metadata", async (t) => {
+  for (const [name, mutate, expectedError, setup = ""] of [
+    [
+      "directory",
+      async (fixture) => {
+        await rm(fixture.gitfile);
+        await mkdir(fixture.gitfile);
+      },
+      /regular non-symlink file/,
+    ],
+    [
+      "symlink",
+      async (fixture) => {
+        const target = join(dirname(fixture.release), "linked-gitfile");
+        await writeFile(target, await readFile(fixture.gitfile));
+        await rm(fixture.gitfile);
+        await createFileSymlink(target, fixture.gitfile);
+      },
+      /regular non-symlink file/,
+    ],
+    ["mode", async () => {}, /mode 0644/, `stat() {
+  if [[ "$2" == "%a" ]]; then printf '600\\n'; else command stat "$@"; fi
+}`],
+    ["owner", async () => {}, /mode 0644/, `stat() {
+  if [[ "$2" == "%u" ]]; then printf '999999\\n'; else command stat "$@"; fi
+}`],
+    ["group", async () => {}, /mode 0644/, `stat() {
+  if [[ "$2" == "%g" ]]; then printf '999999\\n'; else command stat "$@"; fi
+}`],
+    [
+      "hard link",
+      async (fixture) => {
+        await link(fixture.gitfile, join(dirname(fixture.release), "gitfile-hardlink"));
+      },
+      /one hard link/,
+    ],
+  ]) {
+    await t.test(name, async () => {
+      const root = await mkdtemp(join(tmpdir(), `al-lio-release-gitfile-${name}-`));
+      try {
+        const fixture = await createReleaseGitfileFixture(root);
+        await mutate(fixture);
+        await expectGitfileRejection(fixture, expectedError, setup);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("release .git rejects malformed raw bytes before parsing", async (t) => {
+  const malformedCases = [
+    ["empty file", Buffer.alloc(0), /between 1 and 4096 bytes/],
+    ["empty target", Buffer.from("gitdir: \n"), /empty gitdir target/],
+    ["multiple lines", Buffer.from("gitdir: /tmp/one\n/tmp/two\n"), /exactly one control-free line/],
+    ["missing final LF", Buffer.from("gitdir: /tmp/one"), /exactly one control-free line/],
+    ["carriage return", Buffer.from("gitdir: /tmp/one\r\n"), /exactly one control-free line/],
+    ["NUL", Buffer.from("gitdir: /tmp/\0one\n"), /exactly one control-free line/],
+    ["C0 control", Buffer.from("gitdir: /tmp/\u0001one\n"), /exactly one control-free line/],
+    ["DEL control", Buffer.from("gitdir: /tmp/\u007fone\n"), /exactly one control-free line/],
+    ["wrong prefix", Buffer.from("git-dir: /tmp/one\n"), /literal prefix/],
+    ["relative target", Buffer.from("gitdir: ../canonical/.git/worktrees/release\n"), /must be absolute/],
+    ["oversized", Buffer.from(`gitdir: /${"a".repeat(4096)}\n`), /between 1 and 4096 bytes/],
+  ];
+
+  for (const [name, contents, expectedError] of malformedCases) {
+    await t.test(name, async () => {
+      const root = await mkdtemp(join(tmpdir(), `al-lio-release-gitfile-raw-${name}-`));
+      try {
+        const fixture = await createReleaseGitfileFixture(root);
+        await replaceGitfile(fixture, contents);
+        await expectGitfileRejection(fixture, expectedError);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("release gitdir target must be the exact canonical immediate worktree child", async (t) => {
+  await t.test("outside canonical worktrees", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-outside-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      const outside = join(root, "outside-gitdir");
+      await mkdir(outside);
+      await writeGitfileTarget(fixture, toBashPath(outside));
+      await expectGitfileRejection(fixture, /outside the canonical worktrees directory/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("nested descendant", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-nested-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      const nested = join(fixture.linkedGitdir, "nested");
+      await mkdir(nested);
+      await writeGitfileTarget(fixture, toBashPath(nested));
+      await expectGitfileRejection(fixture, /one immediate child/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("symlinked intermediate component", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-symlink-component-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      const worktrees = join(fixture.repository, ".git", "worktrees");
+      const realWorktrees = join(fixture.repository, ".git", "worktrees-real");
+      await rename(worktrees, realWorktrees);
+      await symlink(realWorktrees, worktrees, process.platform === "win32" ? "junction" : "dir");
+      await expectGitfileRejection(fixture, /traverses a symlink/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("release gitdir metadata must link only the canonical repository and release", async (t) => {
+  await t.test("bad commondir", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-commondir-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      await writeFile(join(fixture.linkedGitdir, "commondir"), "../../../outside\n", "utf8");
+      await expectGitfileRejection(fixture, /commondir/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("bad gitdir backpointer", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-backpointer-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      const wrongGitfile = join(root, "wrong-gitfile");
+      await writeFile(wrongGitfile, "wrong\n", "utf8");
+      await writeFile(
+        join(fixture.linkedGitdir, "gitdir"),
+        `${toBashPath(wrongGitfile)}\n`,
+        "utf8",
+      );
+      await expectGitfileRejection(fixture, /backpointer does not identify/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("metadata belonging to another release", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-other-release-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      const otherRelease = join(root, "other-release");
+      git(fixture.repository, [
+        "worktree",
+        "add",
+        "--quiet",
+        "--detach",
+        otherRelease,
+        fixture.commitSha,
+      ]);
+      const otherGitfile = await readFile(join(otherRelease, ".git"), "utf8");
+      await replaceGitfile(fixture, otherGitfile);
+      await expectGitfileRejection(fixture, /backpointer does not identify/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // Source-level assertion rationale: executing the real boundary proves allowed behavior, but cannot prove a forbidden `git -C` call is absent from every trusted-boundary path; this narrow source assertion enforces that negative invariant.
