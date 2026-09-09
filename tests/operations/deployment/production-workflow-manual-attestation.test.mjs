@@ -1,3 +1,5 @@
+// Source-level assertion rationale: GitHub Actions job, environment, and secret ordering cannot be executed safely inside the Node test runner,
+// so those hosted-workflow guarantees remain structural contracts while the embedded attestation decision logic is executed directly below.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
