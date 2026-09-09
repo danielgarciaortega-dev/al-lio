@@ -36,7 +36,7 @@ function exactRun(overrides = {}) {
     status: "completed",
     conclusion: "success",
     head_repository: { full_name: repository },
-    path: ".github/workflows/ci.yml",
+    path: ".github/workflows/ci.yml@main",
     ...overrides,
   };
 }
@@ -74,6 +74,7 @@ test("manual production authorization runs before Production secrets with minimu
   assert.match(preflight, /-f event=push/);
   assert.match(preflight, /-f status=completed/);
   assert.match(preflight, /-f head_sha="\$RELEASE_SHA"/);
+  assert.match(preflight, /run\?\.path === "\.github\/workflows\/ci\.yml@main"/);
   assert.doesNotMatch(preflight, /environment:/);
   assert.doesNotMatch(preflight, /secrets\.PRODUCTION_/);
 
@@ -118,14 +119,15 @@ test("manual CI attestation rejects failed, cancelled, and skipped conclusions",
   }
 });
 
-test("manual CI attestation rejects non-matching SHA, repository, event, branch, or workflow", async () => {
+test("manual CI attestation rejects non-matching SHA, repository, event, branch, workflow, or workflow ref", async () => {
   const workflow = await readFile(workflowUrl, "utf8");
   const cases = [
     exactRun({ head_sha: "f".repeat(40) }),
     exactRun({ head_repository: { full_name: "someone/fork" } }),
     exactRun({ event: "workflow_dispatch" }),
     exactRun({ head_branch: "feature/not-main" }),
-    exactRun({ path: ".github/workflows/other.yml" }),
+    exactRun({ path: ".github/workflows/other.yml@main" }),
+    exactRun({ path: ".github/workflows/ci.yml@feature/not-main" }),
   ];
 
   for (const run of cases) {
