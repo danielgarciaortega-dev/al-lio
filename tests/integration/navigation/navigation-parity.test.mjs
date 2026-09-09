@@ -11,6 +11,10 @@ import test from "node:test";
 
 const read = (path) => readFile(new URL(path, import.meta.url), "utf8");
 
+function navigationGroupLabels(source) {
+  return [...source.matchAll(/label: "([^"]+)",\r?\n\s+tourId:/g)].map((match) => match[1]);
+}
+
 test("desktop and mobile navigation are rendered from one canonical destination model (issue #363)", async () => {
   const [navModel, sidebar, mobile, header] = await Promise.all([
     read("../../../src/components/nav-destinations.ts"),
@@ -38,7 +42,7 @@ test("desktop and mobile navigation are rendered from one canonical destination 
 test("every supported first-level destination appears exactly once, in the agreed order and label (issue #363)", async () => {
   const navModel = await read("../../../src/components/nav-destinations.ts");
 
-  const groupLabels = [...navModel.matchAll(/label: "([^"]+)",\n\s+tourId:/g)].map((m) => m[1]);
+  const groupLabels = navigationGroupLabels(navModel);
   assert.deepEqual(groupLabels, ["Principal", "Comunicación", "Aprendizaje"], "navigation groups drifted from the agreed order");
 
   const hrefs = [...navModel.matchAll(/\{ href: "([^"]+)", label: "([^"]+)", icon: \w+ \}/g)].map((m) => m[1]);
@@ -62,6 +66,13 @@ test("every supported first-level destination appears exactly once, in the agree
   for (const excluded of ["/settings", "/sources", "/links"]) {
     assert.doesNotMatch(navModel, new RegExp(`"${excluded}"`), `${excluded} must not be a navigation or action route`);
   }
+});
+
+test("navigation group parsing is portable across LF and CRLF checkouts (issue #363)", () => {
+  const lf = 'label: "Principal",\n  tourId: "nav-main"';
+  const crlf = lf.replaceAll("\n", "\r\n");
+  assert.deepEqual(navigationGroupLabels(lf), ["Principal"]);
+  assert.deepEqual(navigationGroupLabels(crlf), ["Principal"]);
 });
 
 test("the shared active-route predicate distinguishes roots, child routes and sibling prefixes (issue #363)", async () => {

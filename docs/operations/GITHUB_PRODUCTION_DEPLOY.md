@@ -14,10 +14,15 @@ command remains available for recovery.
 5. `.github/workflows/deploy-production.yml` receives the successful CI result
    and passes `workflow_run.head_sha` to the VPS.
 6. The restricted SSH key can invoke only `deploy <SHA>`.
-7. The forced VPS entrypoint calls `scripts/deploy-production.sh` from the
-   currently healthy release.
-8. The guarded script builds, audits migrations, replaces only the web service,
-   verifies health/readiness and rolls the web service back on failure.
+7. The installed forced-command entrypoint verifies that the requested SHA is
+   reachable from `origin/main`, materializes the deployment controller from
+   exact regular Git blobs into a private temporary directory, and never
+   executes deployment code from the mutable active release worktree.
+8. The trusted controller validates the active release before using its files,
+   then one shared policy validates the active-SHA-to-candidate-SHA transition.
+9. The guarded script builds, audits migrations, replaces only the web service,
+   verifies health, readiness and exact release identity, and rolls the web
+   service back on failure.
 
 The deployment workflow is serialized with `cancel-in-progress: false`. A
 release already changing production is never interrupted by a newer merge. The
@@ -37,6 +42,30 @@ install -m 755 scripts/github-actions-deploy-entrypoint.sh \
   "$HOME/.local/bin/al-lio-github-deploy"
 ```
 
+The installed `$HOME/.local/bin/al-lio-github-deploy` file is part of the
+production trust root and deliberately lives outside every release worktree.
+A routine deployment does not replace it automatically. When a reviewed change
+modifies `scripts/github-actions-deploy-entrypoint.sh`, treat the entrypoint
+upgrade as a controlled bootstrap change:
+
+1. set the repository variable `PRODUCTION_AUTO_DEPLOY_ENABLED=false` before
+   merging the entrypoint change, so the previous forced command cannot launch
+   the post-merge release automatically;
+2. merge only after the required pull-request checks are green;
+3. through the trusted administrative SSH identity, fetch the exact merged
+   `main` SHA and install `scripts/github-actions-deploy-entrypoint.sh` from
+   that reviewed Git object into `$HOME/.local/bin/al-lio-github-deploy`;
+4. verify the installed file is owned by the deploy user, mode `0755`, and
+   byte-identical to the exact merged Git blob without printing secret data;
+5. restore `PRODUCTION_AUTO_DEPLOY_ENABLED=true` only after that verification;
+6. use `workflow_dispatch` with the exact merged SHA to run the first deployment
+   through the upgraded trust root.
+
+Do not bootstrap an entrypoint upgrade by running the copy stored in the active
+release worktree. The installed forced command is the component that prevents
+mutable release bytes from becoming executable before release integrity has
+been established.
+
 Add the public key to that user's `~/.ssh/authorized_keys` with restrictions:
 
 ```text
@@ -45,8 +74,8 @@ restrict,command="/home/ubuntu/.local/bin/al-lio-github-deploy" ssh-ed25519 <pub
 
 The forced command rejects an empty command, a shell command and every argument
 except one lowercase 40-character SHA. The deploy user must not be `root`; it
-needs access only to the existing Docker deployment boundary and AL-LIO release
-directories.
+needs access only to the existing Docker deployment boundary, the canonical Git
+object store and AL-LIO release directories.
 
 Obtain the SSH host public key through an already trusted administrative
 connection. Store the complete `known_hosts` line; do not discover and trust a
@@ -92,7 +121,8 @@ only when deliberately changing to a human-approved production gate.
 6. Perform the desired owner-facing functional review in production.
 
 No SSH session or coding-agent involvement is required for a healthy routine
-release.
+release unless the forced-command trust root itself is being upgraded as
+described above.
 
 ## Manual GitHub retry
 
@@ -109,14 +139,45 @@ Repeatedly dispatching the SHA already running is a safe health-checked no-op.
 - Pull-request CI, fork CI and manually dispatched CI do not start a deployment.
 - Missing configuration or an invalid SHA fails before opening SSH.
 - SSH uses the pinned host key and fails closed if the server identity changes.
+- The installed forced command refuses a SHA outside `origin/main` and accepts
+  deployment-controller files only when their exact candidate tree entries have
+  the expected regular-blob modes; it materializes those blobs privately and
+  verifies their object identity before execution.
 - A build failure leaves the current production web container untouched.
 - A failure after web replacement invokes the existing automatic rollback.
 - Infrastructure, Radar, operator-managed catalogue and non-additive migration
-  changes stop and require [`DEPLOY_VPS.md`](DEPLOY_VPS.md). The only Compose
-  exception is a strictly additive, namespaced environment passthrough under
-  `al_lio_web` or `al_lio_radar`. The guard validates the service, target key,
-  host-variable namespace, default syntax, placement and uniqueness. Any removal,
-  modification, relocation, duplicate or unrelated edit fails closed.
+  changes stop and require [`DEPLOY_VPS.md`](DEPLOY_VPS.md).
+- Compose permits a strictly namespaced environment addition under
+  `al_lio_web` or `al_lio_radar`, or one exact removal pre-approved by the
+  active release. An approval records the service, destination key, source
+  variable and exact default as inert data.
+- A removal takes two releases. Release A adds the exact approval without
+  changing Compose. Release B removes both the mapping and the approval. The
+  transition reads authorization from A's Git object and requires B not to
+  retain it, so B cannot authorize its own removal or leave a reusable grant.
+- Every staged approval expires at the next transition. If the mapping is not
+  removed, the next release must revoke the approval; an unchanged approval
+  cannot survive across multiple releases. When the active release contains
+  any approval, the candidate approval file must contain no active records, so
+  approvals cannot be retained, replaced or combined with newly staged grants.
+- Approval data is accepted only from a `100644` regular blob in each Git tree.
+  Executable files, symlinks, gitlinks and unknown types fail closed.
+- Modifications, moves between services, duplicates, reorderings, wildcards,
+  stale approvals and unrelated Compose changes fail closed.
+- A successful cutover requires `/api/version` to report the requested full SHA
+  both inside the web container and through `https://al-lio.app`.
+
+`production-transition-policy.sh` currently exposes the post-merge deployment
+contract: release eligibility (the candidate is already reachable from
+`origin/main`) and current-to-candidate transition safety are invoked together.
+PR2 must reuse or extract the transition-safety core for pre-merge evaluation
+without treating main reachability as proof that a proposed change is safe.
+
+The migration statement detector is a conservative blacklist for known
+destructive or structural SQL. Passing it does not prove that a migration is
+semantically non-destructive. Backup, restore verification, rehearsal,
+additive migration discipline and rollback-compatible application changes
+remain mandatory.
 
 If a workflow reports `CRITICAL`, disable
 `PRODUCTION_AUTO_DEPLOY_ENABLED`, prevent further merges and follow the manual
