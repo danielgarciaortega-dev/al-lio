@@ -88,7 +88,7 @@ jobs:
               run?.head_branch === "main" &&
               run?.status === "completed" &&
               run?.head_repository?.full_name === repository &&
-              run?.path === ".github/workflows/ci.yml",
+              run?.path === ".github/workflows/ci.yml@main",
           );
 
           if (exactRuns.length !== 1) {
