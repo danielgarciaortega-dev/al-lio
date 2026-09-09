@@ -130,6 +130,8 @@ build_expected_release_manifest() {
     return 1
   }
 
+  ((${#manifest_records[@]} > 0)) || return 0
+
   if ! builtin printf '%s\0' "${manifest_records[@]}" | LC_ALL=C /usr/bin/sort -z -u; then
     release_worktree_integrity_error="Cannot sort the expected release manifest deterministically."
     return 1
