@@ -11,6 +11,11 @@ loadEnvConfig(process.cwd(), process.env.NODE_ENV !== "production");
 
 const errors = [];
 const production = process.env.NODE_ENV === "production";
+const releaseSha = process.env.AL_LIO_RELEASE_SHA?.trim();
+
+if (production && !/^[0-9a-f]{40}$/.test(releaseSha ?? "")) {
+  errors.push("AL_LIO_RELEASE_SHA debe contener el SHA completo inyectado por el mecanismo de release");
+}
 
 const databaseUrl = parseUrl("DATABASE_URL", true);
 const baseUrl = parseUrl("BASE_URL", production);

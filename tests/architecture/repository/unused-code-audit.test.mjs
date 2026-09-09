@@ -1,3 +1,7 @@
+// Source-level assertion rationale: package scripts, the pinned Knip configuration,
+// and the reviewed debt baseline are repository policy files rather than runtime
+// modules. Reading them directly verifies the exact CI and classification contract.
+
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -15,7 +19,7 @@ test("unused-code audit is pinned and enforced by CI", () => {
   assert.equal(packageJson.dependencies["server-only"], "0.0.1");
   assert.equal(packageJson.scripts["audit:unused"], "node scripts/check-unused-code.mjs");
   assert.equal(packageJson.scripts["audit:unused:raw"], "knip");
-  assert.match(packageJson.scripts.ci, /^npm run audit:unused && /);
+  assert.match(packageJson.scripts.ci, /^npm run test:taxonomy && npm run audit:unused && /);
 });
 
 test("Knip models framework and repository entry points without blanket ignores", () => {

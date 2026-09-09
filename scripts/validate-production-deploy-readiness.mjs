@@ -32,31 +32,346 @@ function read(path) {
   return existsSync(fullPath) ? readFileSync(fullPath, "utf-8").replace(/\r\n/g, "\n") : "";
 }
 
+function shellTextOutsideQuotes(line, maskDoubleQuotes) {
+  let result = "";
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < line.length; index++) {
+    const character = line[index];
+    if (escaped) {
+      result += quote ? " " : character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      result += quote ? " " : character;
+      escaped = true;
+      continue;
+    }
+    if (quote === "'") {
+      result += " ";
+      if (character === "'") quote = "";
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = "";
+        result += " ";
+      } else {
+        result += maskDoubleQuotes ? " " : character;
+      }
+      continue;
+    }
+    if (character === "'") {
+      quote = "'";
+      result += " ";
+      continue;
+    }
+    if (character === '"') {
+      quote = '"';
+      result += " ";
+      continue;
+    }
+    if (character === "#" && (index === 0 || /\s/.test(line[index - 1]))) break;
+    result += character;
+  }
+  return result;
+}
+
+const shellCommandBoundary = String.raw`(?:^\s*|(?:&&|\|\||[;|!(])\s*|\b(?:if|elif|while|until|then|do)\s+)`;
+const shellCommandWrappers = String.raw`(?:(?:command\s+)|(?:env(?:\s+[A-Za-z_][A-Za-z0-9_]*=[^\s]+)+\s+))*`;
+const curlInvocationPattern = new RegExp(`${shellCommandBoundary}${shellCommandWrappers}curl(?:\\s|$)`);
+const curlSubstitutionPattern = new RegExp(String.raw`\$\(\s*${shellCommandWrappers}curl(?:\s|$)`);
+const dockerWgetCommand = String.raw`${shellCommandWrappers}(?:timeout\s+\S+\s+)?docker\s+exec\b.*\bwget(?:\s|$)`;
+const dockerWgetInvocationPattern = new RegExp(`${shellCommandBoundary}${dockerWgetCommand}`);
+const dockerWgetSubstitutionPattern = new RegExp(String.raw`\$\(\s*${dockerWgetCommand}`);
+
+function isCurlInvocation(line) {
+  return curlInvocationPattern.test(shellTextOutsideQuotes(line, true))
+    || curlSubstitutionPattern.test(shellTextOutsideQuotes(line, false));
+}
+
+function isDockerExecWgetInvocation(line) {
+  return dockerWgetInvocationPattern.test(shellTextOutsideQuotes(line, true))
+    || dockerWgetSubstitutionPattern.test(shellTextOutsideQuotes(line, false));
+}
+
+function classifyCurlLine(line) {
+  if (!/\bcurl\b/.test(line)) return "absent";
+  if (isCurlInvocation(line)) return "invocation";
+  const command = line.trim();
+  if (command.startsWith("#") || /^for\s+command_name\b.*\bcurl\b/.test(command)) return "excluded";
+  if (!/\bcurl\b/.test(shellTextOutsideQuotes(line, true))) return "excluded";
+  return "unclassified";
+}
+
+function classifyDockerExecWgetLine(line) {
+  if (!/\bdocker\s+exec\b.*\bwget\b/.test(line)) return "absent";
+  if (isDockerExecWgetInvocation(line)) return "invocation";
+  const command = line.trim();
+  if (command.startsWith("#")) return "excluded";
+  if (!/\bdocker\s+exec\b.*\bwget\b/.test(shellTextOutsideQuotes(line, true))) return "excluded";
+  return "unclassified";
+}
+
 console.log("\n-- scripts/deploy-production.sh --");
 const deployScript = read("scripts/deploy-production.sh");
 const composeEnvGuard = read("scripts/lib/compose-env-guard.sh");
+const transitionPolicy = read("scripts/lib/production-transition-policy.sh");
+const composeRemovalApprovals = read("scripts/config/production-compose-env-removals.allowlist");
+const releaseEnvPreparer = read("scripts/prepare-release-env.sh");
+const releaseWorktreeIntegrity = read("scripts/lib/release-worktree-integrity.sh");
+const gitAttributes = read(".gitattributes");
+const productionShellLines = deployScript.split("\n");
+const productionCurlClassifications = productionShellLines.map((line) => ({ line, kind: classifyCurlLine(line) }));
+const productionWgetClassifications = productionShellLines.map((line) => ({ line, kind: classifyDockerExecWgetLine(line) }));
+const productionCurlProbeLines = productionCurlClassifications
+  .filter(({ kind }) => kind === "invocation")
+  .map(({ line }) => line);
+const productionWgetProbeLines = productionWgetClassifications
+  .filter(({ kind }) => kind === "invocation")
+  .map(({ line }) => line);
+const unclassifiedProductionHttpLines = [
+  ...productionCurlClassifications,
+  ...productionWgetClassifications,
+].filter(({ kind }) => kind === "unclassified");
+const productionHttpProbeLines = [...productionCurlProbeLines, ...productionWgetProbeLines];
+check(
+  "HTTP invocation discovery classifies wrappers, exclusions and unknown forms fail closed",
+  [
+    "curl https://example.test/api/future",
+    "command curl https://example.test/api/future",
+    "env FOO=bar curl https://example.test/api/future",
+    'result="$(curl https://example.test/api/future)"',
+    "if curl https://example.test/api/future; then :; fi",
+    "foo && curl https://example.test/api/future",
+    "! curl https://example.test/api/future",
+  ].every((line) => classifyCurlLine(line) === "invocation")
+    && [
+      "docker exec web wget http://127.0.0.1/api/future",
+      "timeout 20s docker exec web wget -T 5 http://127.0.0.1/api/future",
+      "command docker exec web wget http://127.0.0.1/api/future",
+      "env FOO=bar docker exec web wget http://127.0.0.1/api/future",
+    ].every((line) => classifyDockerExecWgetLine(line) === "invocation")
+    && [
+      "# curl https://example.test/api/future",
+      "for command_name in git curl timeout; do",
+      'documentation="curl https://example.test/api/future"',
+      'printf \'curl https://example.test/api/future\\n\'',
+      'echo "curl https://example.test/api/future"',
+    ].every((line) => classifyCurlLine(line) === "excluded")
+    && [
+      "# docker exec web wget http://127.0.0.1/api/future",
+      'documentation="docker exec web wget http://127.0.0.1/api/future"',
+      'printf \'docker exec web wget /api/future\\n\'',
+      'echo "docker exec web wget /api/future"',
+    ].every((line) => classifyDockerExecWgetLine(line) === "excluded")
+    && classifyCurlLine("sudo curl https://example.test/api/future") === "unclassified"
+    && classifyDockerExecWgetLine("sudo docker exec web wget /api/future") === "unclassified",
+);
 check("guarded production deploy script exists", existsSync(join(root, "scripts/deploy-production.sh")));
 check("deploy script requires an exact full SHA", deployScript.includes("^[0-9a-f]{40}$"));
-check("deploy script accepts only commits reachable from main", deployScript.includes('merge-base --is-ancestor "$release_sha" origin/main'));
+check("shared production transition policy exists", existsSync(join(root, "scripts/lib/production-transition-policy.sh")));
+check("shell scripts are committed with LF line endings", /^\*\.sh text eol=lf$/m.test(gitAttributes));
+check(
+  "deploy script uses the shared current-to-candidate policy",
+  deployScript.includes("lib/production-transition-policy.sh")
+    && deployScript.includes('validate_production_transition "$repository_dir" "$current_sha" "$release_sha" origin/main'),
+);
+check("shared policy accepts only commits reachable from main", transitionPolicy.includes('merge-base --is-ancestor "$candidate_sha" "$main_ref"'));
+check("shared policy rejects downgrades and divergence", transitionPolicy.includes('merge-base --is-ancestor "$current_sha" "$candidate_sha"'));
+check("shared policy protects blocked infrastructure", transitionPolicy.includes("infra/Dockerfile") && transitionPolicy.includes("data/learning-competencies.json"));
+check("shared policy protects migration history", transitionPolicy.includes("Existing migrations are immutable") && transitionPolicy.includes("contains a destructive or structural statement"));
+const expectedProtectedControlPlanePaths = [
+  ".dockerignore",
+  ".github/workflows/ci.yml",
+  ".github/workflows/deploy-production.yml",
+  "scripts/deploy-production.sh",
+  "scripts/github-actions-deploy-entrypoint.sh",
+  "scripts/lib/production-transition-policy.sh",
+  "scripts/lib/compose-env-guard.sh",
+  "scripts/lib/release-worktree-integrity.sh",
+  "scripts/prepare-release-env.sh",
+  "scripts/validate-production-transition.sh",
+  "scripts/validate-production-deploy-readiness.mjs",
+  "scripts/validate-runtime-env.mjs",
+  "src/app/api/version/route.ts",
+  "src/app/api/ready/route.ts",
+  "src/lib/db/pool.ts",
+  "scripts/postgres",
+  "infra/postgres/schema.sql",
+  "infra/postgres/baseline.sha256",
+];
+const protectedControlPlaneBlock = transitionPolicy.match(
+  /^readonly -a PRODUCTION_TRANSITION_PROTECTED_CONTROL_PLANE=\(\r?\n(?<entries>[\s\S]*?)\r?\n\)$/m,
+)?.groups?.entries;
+const actualProtectedControlPlanePaths = protectedControlPlaneBlock
+  ? [...protectedControlPlaneBlock.matchAll(/^\s*"([^"]+)",?\r?$/gm)].map((match) => match[1])
+  : [];
+check(
+  "shared policy protects the production control-plane",
+  actualProtectedControlPlanePaths.length === expectedProtectedControlPlanePaths.length
+    && actualProtectedControlPlanePaths.every((entry, index) => entry === expectedProtectedControlPlanePaths[index])
+    && transitionPolicy.includes('PRODUCTION_TRANSITION_GITATTRIBUTES_PATHSPEC=":(glob)**/.gitattributes"')
+    && transitionPolicy.includes('"$PRODUCTION_TRANSITION_GITATTRIBUTES_PATHSPEC"')
+    && transitionPolicy.includes("protected production control-plane"),
+);
+check(
+  "new migrations must be regular 100644 blobs read by object id",
+  transitionPolicy.includes("validate_regular_git_blob")
+    && transitionPolicy.includes('git -C "$repository" cat-file blob "$migration_object"')
+    && transitionPolicy.includes("^infra/postgres/migrations/[0-9]{4}_[a-z0-9_]+\\.sql$"),
+);
 check("deploy script serializes releases", deployScript.includes("flock -n"));
-check("deploy script creates and verifies PostgreSQL backups", deployScript.includes("backup-production.sh") && deployScript.includes("verify-backup-production.sh"));
+check(
+  "deploy script binds restore and release provenance to the exact declared PostgreSQL backup",
+  deployScript.includes('backup_output="$(')
+    && deployScript.includes('validate_postgres_backup_output "$backup_output"')
+    && deployScript.includes('"$declared_checksum_file" == "$postgres_backup_file.sha256"')
+    && deployScript.includes('"${checksum_lines[0]}" == "$calculated_checksum  $postgres_backup_file"')
+    && deployScript.includes('sha256sum --check "$declared_checksum_file"')
+    && deployScript.includes('verify-backup-production.sh" "$postgres_backup_file"')
+    && deployScript.includes('--no-acl < "$postgres_backup_file"')
+    && deployScript.includes("printf 'db_backup_path=%s\\n' \"${postgres_backup_file:-not-required}\"")
+    && !deployScript.includes('ls -1t "$backup_dir"/al_lio_*.dump'),
+);
+check(
+  "every routine production HTTP probe has connection and overall bounds",
+  unclassifiedProductionHttpLines.length === 0
+    && productionCurlProbeLines.length === 7
+    && productionWgetProbeLines.length === 3
+    && productionCurlProbeLines.every((line) => /\bcurl\b.*--connect-timeout 5\b.*--max-time 20\b/.test(line))
+    && productionWgetProbeLines.every((line) => /timeout 20s docker exec\b.*\bwget -T 5\b/.test(line))
+    && ["health", "ready", "version", "job-radar"].every((endpoint) =>
+      productionHttpProbeLines.some((line) => line.includes(`/api/${endpoint}`)))
+    && /for command_name in [^\n]*\btimeout\b/.test(deployScript),
+);
 check("deploy script rehearses migrations in an isolated database", deployScript.includes("al_lio_rehearsal_"));
 check("deploy script replaces only the web service", deployScript.includes("up -d --no-deps al_lio_web"));
 check("deploy script has an automatic web rollback", deployScript.includes("rollback_web"));
+check(
+  "deploy script verifies active worktree and release identity",
+  deployScript.includes('validate_release_worktree_integrity "$previous_release_dir" "$current_sha"')
+    && deployScript.includes("Current release integrity check failed")
+    && deployScript.includes('read_env_value AL_LIO_RELEASE_SHA "$previous_release_dir/.env"'),
+);
 check("deploy script never removes Compose volumes", !deployScript.includes("down -v") && !deployScript.includes("docker volume rm"));
 check("Compose environment guard exists", existsSync(join(root, "scripts/lib/compose-env-guard.sh")));
 check(
-  "deploy script admits only structurally safe additive service environment mappings",
-  deployScript.includes("validate_compose_env_additions")
-    && deployScript.includes("lib/compose-env-guard.sh")
+  "shared policy admits only classified service environment transitions",
+  transitionPolicy.includes("validate_compose_env_transition")
     && composeEnvGuard.includes("validate_new_environment_mapping")
     && composeEnvGuard.includes("validate_unique_environment_keys")
-    && composeEnvGuard.includes('[[ "$line" == +* ]] || return 1')
+    && composeEnvGuard.includes("removal_is_approved")
     && composeEnvGuard.includes("AL_LIO_RADAR_${key}")
     && composeEnvGuard.includes("DISCOVERY_*")
     && composeEnvGuard.includes("OPENAI_API_KEY"),
 );
-check("deploy script rejects every other Compose edit", deployScript.includes("Docker Compose changed outside the allowlisted service environment passthroughs"));
+check(
+  "Compose removals require exact current-release data",
+  transitionPolicy.includes("validate_and_load_approval_blob")
+    && transitionPolicy.includes('cat-file blob "$object" > "$raw_file"')
+    && composeEnvGuard.includes("service|destination_key|source_variable|exact_default")
+    && composeEnvGuard.includes('removal_is_approved "$current_approval_data"'),
+);
+check(
+  "approval blobs are byte-validated before Bash parsing",
+  transitionPolicy.includes("PRODUCTION_TRANSITION_APPROVAL_MAX_BYTES=65536")
+    && transitionPolicy.includes("od -An -v -t u1")
+    && transitionPolicy.includes("forbidden NUL byte")
+    && transitionPolicy.includes("not part of CRLF")
+    && transitionPolicy.includes("tr -d '\\015'"),
+);
+check(
+  "approval temporary files are private, cleaned and do not replace caller traps",
+  transitionPolicy.includes('chmod 600 "$raw_file"')
+    && transitionPolicy.includes('if ! rm -f -- "$raw_file"')
+    && transitionPolicy.includes("private temporary validation file could not be removed")
+    && !transitionPolicy.slice(
+      transitionPolicy.indexOf("validate_and_load_approval_blob()"),
+      transitionPolicy.indexOf("validate_production_transition()"),
+    ).includes("trap "),
+);
+check(
+  "deploy preflight requires approval validator commands",
+  ["mktemp", "od", "tr", "wc"].every((command) => (
+    deployScript.match(new RegExp(`for command_name in [^\\n]*\\b${command}\\b`))
+  )),
+);
+check(
+  "approval audit output omits exact defaults",
+  composeEnvGuard.includes("approval_audit_id")
+    && transitionPolicy.includes("state=%s")
+    && transitionPolicy.includes("join_approval_audit_records")
+    && deployScript.includes("join_approval_audit_records")
+    && !transitionPolicy.includes("source=%s default=%s"),
+);
+check(
+  "Compose removal approvals expire on the next release",
+  composeEnvGuard.includes("classify_approval_transition")
+    && composeEnvGuard.includes("Current release has staged removal approvals, so candidate must contain no active approval")
+    && composeEnvGuard.includes("staged_compose_env_removal_approvals")
+    && composeEnvGuard.includes("consumed_compose_env_removal_approvals")
+    && composeEnvGuard.includes("revoked_compose_env_removal_approvals"),
+);
+check(
+  "approval files are regular non-executable blobs from the Git tree",
+  transitionPolicy.includes('git -C "$repository" ls-tree "$sha" -- "$path"')
+    && transitionPolicy.includes('"$mode" == "100644"')
+    && transitionPolicy.includes('"$type" == "blob"'),
+);
+check(
+  "Compose metadata and mode changes fail closed",
+  composeEnvGuard.includes('git -C "$repository" diff --summary')
+    && composeEnvGuard.includes("Compose file metadata or mode changed"),
+);
+check(
+  "normal release contains no reusable legacy removal approval",
+  !/^al_lio_(web|radar)\|/m.test(composeRemovalApprovals)
+    && !/(INFOJOBS|ADZUNA|JOOBLE|AL_LIO_DEMO_ACCESS_ENABLED)/.test(composeRemovalApprovals),
+);
+check("shared policy rejects every other Compose edit", transitionPolicy.includes("Docker Compose changed outside the approved service environment transition policy"));
+check(
+  "release environment is copied privately and receives the exact SHA",
+  releaseEnvPreparer.includes('install -m 600 "$previous_env" "$release_env"')
+    && releaseEnvPreparer.includes('write_env_value AL_LIO_IMAGE_TAG "$release_sha"')
+    && releaseEnvPreparer.includes('write_env_value AL_LIO_RELEASE_SHA "$release_sha"')
+    && releaseEnvPreparer.includes('validate_managed_env_value AL_LIO_IMAGE_TAG "$release_sha"')
+    && releaseEnvPreparer.includes('validate_managed_env_value AL_LIO_RELEASE_SHA "$release_sha"'),
+);
+check(
+  "release worktrees reject tracked, untracked and unexpected ignored files",
+  existsSync(join(root, "scripts/lib/release-worktree-integrity.sh"))
+    && releaseWorktreeIntegrity.includes("status --porcelain --untracked-files=all")
+    && releaseWorktreeIntegrity.includes("status --porcelain --ignored --untracked-files=all")
+    && releaseWorktreeIntegrity.includes('"!! .env"')
+    && !deployScript.includes("--untracked-files=no")
+    && !releaseEnvPreparer.includes("--untracked-files=no"),
+);
+check(
+  "candidate integrity is checked before build and cutover",
+  deployScript.split('validate_release_worktree_integrity "$release_dir" "$release_sha"').length >= 4
+    && deployScript.includes("Candidate integrity check failed before build")
+    && deployScript.includes("Candidate integrity check failed before cutover"),
+);
+check("deploy verifies internal and public release identity", deployScript.includes("/api/version") && deployScript.includes('public_version_result="$release_sha"'));
+check(
+  "deploy rechecks candidate identity immediately before cutover",
+  deployScript.includes("Candidate AL_LIO_IMAGE_TAG changed before cutover")
+    && deployScript.includes("Candidate AL_LIO_RELEASE_SHA changed before cutover")
+    && deployScript.includes('validate_release_worktree_integrity "$release_dir" "$release_sha"')
+    && deployScript.includes("Candidate integrity check failed before cutover"),
+);
+check(
+  "deploy writes private success and failure release records",
+  deployScript.includes('write_release_record "approved"')
+    && deployScript.includes('write_release_record "failed"')
+    && deployScript.includes('chmod 600 "$temp_record"')
+    && deployScript.includes("staged_approvals=")
+    && deployScript.includes("consumed_approvals=")
+    && deployScript.includes("revoked_approvals=")
+    && deployScript.includes("rollback_result="),
+);
 
 console.log("\n-- .github/workflows/deploy-production.yml --");
 const deployWorkflow = read(".github/workflows/deploy-production.yml");
@@ -116,6 +431,7 @@ check("DATABASE_URL uses restricted al_lio_app role", envExample.includes("DATAB
 check("DATABASE_MIGRATION_URL uses admin role", envExample.includes("DATABASE_MIGRATION_URL=postgresql://al_lio:"));
 check("documents shared radar webhook secret", envExample.includes("AL_LIO_RADAR_WEBHOOK_SECRET=REPLACE_ME"));
 check("documents immutable radar image tag", envExample.includes("AL_LIO_RADAR_IMAGE_TAG="));
+check("release identity is not a developer-managed environment placeholder", !envExample.includes("AL_LIO_RELEASE_SHA="));
 check("documents dormant Radar publication defaults", [
   "AL_LIO_RADAR_DELIVERY_SCHEMA_VERSION=3",
   "AL_LIO_RADAR_AUTONOMOUS_PUBLICATION_ENABLED=false",
@@ -168,6 +484,51 @@ check(
   "runbook documents immutable image rollback",
   runbook.includes("AL_LIO_IMAGE_TAG") && runbook.includes("Application rollback"),
 );
+check(
+  "runbook preserves immutable release topology for exceptional deploys",
+  runbook.includes("/srv/danicode/releases/al-lio-")
+    && runbook.includes("worktree add --detach")
+    && runbook.includes("prepare-release-env.sh")
+    && !runbook.includes("git checkout --detach"),
+);
+check("runbook verifies the exact public release identity", runbook.includes("/api/version") && runbook.includes("AL_LIO_RELEASE_SHA"));
+check(
+  "runbook gives executable backup, restore-test and rehearsal commands",
+  runbook.includes("backup-production.sh")
+    && runbook.includes("verify-backup-production.sh")
+    && runbook.includes("al_lio_rehearsal_")
+    && runbook.includes("pg_restore")
+    && runbook.includes("schema_migrations"),
+);
+check(
+  "runbook preserves Radar around migrations",
+  runbook.includes("docker stop --time 30 al_lio_radar")
+    && runbook.includes("al_lio_radar_data:/source:ro")
+    && runbook.includes("docker start al_lio_radar"),
+);
+check(
+  "runbook gives executable cutover, smoke, record and rollback commands",
+  runbook.includes("up -d --no-deps al_lio_web")
+    && runbook.includes("/api/job-radar")
+    && runbook.includes("release-$AL_LIO_RELEASE_STARTED_AT")
+    && runbook.includes("rollback_image"),
+);
+check(
+  "runbook includes the owner functional smoke and web-only persistence check",
+  [
+    "login", "Google OAuth", "Calendar connect/disconnect", "dashboard",
+    "Create/complete/delete task", "Create note + reload", "profile/cycle persistence",
+    "Radar visibility", "idempotent delivery", "Work", "Courses", "Events/Challenges",
+    "docker restart al_lio_web",
+  ].every((entry) => runbook.includes(entry)),
+);
+
+console.log("\n-- src/app/api/version/route.ts --");
+const versionRoute = read("src/app/api/version/route.ts");
+check("version endpoint exists", existsSync(join(root, "src/app/api/version/route.ts")));
+check("version endpoint validates a full lowercase SHA", versionRoute.includes("^[0-9a-f]{40}$"));
+check("version endpoint fails explicitly when identity is unavailable", versionRoute.includes("releaseSha: null") && versionRoute.includes("status: 503"));
+check("version endpoint disables caching", versionRoute.includes('"Cache-Control": "no-store"'));
 
 console.log("\n-- docs/operations/PRIMARY_DOMAIN_MIGRATION.md --");
 const domainMigration = read("docs/operations/PRIMARY_DOMAIN_MIGRATION.md");

@@ -11,8 +11,10 @@ readonly WEB_CONTAINER="al_lio_web"
 readonly POSTGRES_CONTAINER="al_lio_postgres"
 readonly RADAR_CONTAINER="al_lio_radar"
 
-# shellcheck source=scripts/lib/compose-env-guard.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib/compose-env-guard.sh"
+# shellcheck source=scripts/lib/production-transition-policy.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/production-transition-policy.sh"
+# shellcheck source=scripts/lib/release-worktree-integrity.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/release-worktree-integrity.sh"
 
 repository_dir="${AL_LIO_REPOSITORY_DIR:-$DEFAULT_REPOSITORY_DIR}"
 releases_dir="${AL_LIO_RELEASES_DIR:-$DEFAULT_RELEASES_DIR}"
@@ -23,17 +25,37 @@ health_interval_seconds="${AL_LIO_HEALTH_INTERVAL_SECONDS:-3}"
 release_sha=""
 release_short_sha=""
 release_dir=""
+current_sha=""
 previous_release_dir=""
 previous_web_image=""
 postgres_container_id=""
 radar_container_id=""
 rehearsal_database=""
 postgres_backup_file=""
+postgres_backup_checksum="not-required"
 radar_backup_file=""
+radar_backup_status="not-required"
 radar_stopped=0
 web_replacement_started=0
-allowed_compose_env_mappings=()
-allowed_compose_env_lines=()
+release_started_at=""
+release_record=""
+release_record_written=0
+policy_result="not-run"
+pending_migration_ids="none"
+applied_migration_ids="none"
+restore_verification_result="not-required"
+rehearsal_result="not-required"
+internal_health_result="not-run"
+internal_readiness_result="not-run"
+internal_version_result="not-run"
+public_health_result="not-run"
+public_readiness_result="not-run"
+public_version_result="not-run"
+automated_smoke_result="not-run"
+functional_smoke_result="pending-owner-review"
+postgres_container_preserved="not-checked"
+radar_container_preserved="not-checked"
+rollback_result="not-invoked"
 
 usage() {
   cat <<'EOF'
@@ -83,25 +105,116 @@ read_env_value() {
   printf '%s' "$value"
 }
 
-write_env_value() {
-  local key="$1"
-  local value="$2"
-  local env_file="$3"
-  local temp_file="${env_file}.tmp.$$"
+validate_postgres_backup_output() {
+  local backup_output="$1"
+  local declared_checksum_file=""
+  local backup_basename=""
+  local calculated_checksum=""
+  local -a backup_output_lines=()
+  local -a checksum_lines=()
 
-  awk -v key="$key" -v value="$value" '
-    BEGIN { found = 0 }
-    index($0, key "=") == 1 {
-      if (!found) print key "=" value
-      found = 1
-      next
-    }
-    { print }
-    END { if (!found) print key "=" value }
-  ' "$env_file" > "$temp_file"
+  mapfile -t backup_output_lines <<< "$backup_output"
+  [[ "${#backup_output_lines[@]}" -eq 2 ]] ||
+    fail "PostgreSQL backup output must contain exactly the declared dump and checksum lines."
+  [[ "${backup_output_lines[0]}" == "Backup creado y validado: "* ]] ||
+    fail "PostgreSQL backup output did not declare the exact dump path."
+  [[ "${backup_output_lines[1]}" == "Checksum: "* ]] ||
+    fail "PostgreSQL backup output did not declare the exact checksum path."
 
-  chmod 600 "$temp_file"
-  mv -- "$temp_file" "$env_file"
+  postgres_backup_file="${backup_output_lines[0]#Backup creado y validado: }"
+  declared_checksum_file="${backup_output_lines[1]#Checksum: }"
+  [[ -n "$postgres_backup_file" &&
+    "$declared_checksum_file" == "$postgres_backup_file.sha256" ]] ||
+    fail "PostgreSQL backup output contains inconsistent paths."
+  [[ "$postgres_backup_file" == /* &&
+    "${postgres_backup_file%/*}" == "$backup_dir" ]] ||
+    fail "Declared PostgreSQL backup is outside the canonical backup directory."
+  backup_basename="${postgres_backup_file##*/}"
+  [[ "$backup_basename" =~ ^al_lio_[0-9]{8}T[0-9]{6}Z\.dump$ ]] ||
+    fail "Declared PostgreSQL backup filename is invalid."
+  [[ -f "$postgres_backup_file" && ! -L "$postgres_backup_file" &&
+    -s "$postgres_backup_file" ]] ||
+    fail "Declared PostgreSQL backup must be a non-empty regular file, not a symlink."
+  [[ "$(readlink -f -- "$postgres_backup_file")" == "$postgres_backup_file" ]] ||
+    fail "Declared PostgreSQL backup path is not canonical."
+  [[ -f "$declared_checksum_file" && ! -L "$declared_checksum_file" &&
+    -s "$declared_checksum_file" ]] ||
+    fail "Declared PostgreSQL checksum must be a non-empty regular file, not a symlink."
+  [[ "$(readlink -f -- "$declared_checksum_file")" == "$declared_checksum_file" ]] ||
+    fail "Declared PostgreSQL checksum path is not canonical."
+
+  calculated_checksum="$(sha256sum "$postgres_backup_file" | awk '{ print $1 }')"
+  [[ "$calculated_checksum" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "Declared PostgreSQL backup did not produce a valid SHA-256."
+  mapfile -t checksum_lines < "$declared_checksum_file"
+  [[ "${#checksum_lines[@]}" -eq 1 &&
+    "${checksum_lines[0]}" == "$calculated_checksum  $postgres_backup_file" ]] ||
+    fail "PostgreSQL checksum sidecar is not bound to the exact declared dump."
+  sha256sum --check "$declared_checksum_file" ||
+    fail "PostgreSQL checksum verification failed for the exact declared dump."
+  postgres_backup_checksum="$calculated_checksum"
+}
+
+write_release_record() {
+  local outcome="$1"
+  local staged_approvals="none"
+  local consumed_approvals="none"
+  local revoked_approvals="none"
+  local temp_record=""
+
+  [[ -n "$release_started_at" && -n "$release_short_sha" ]] || return 1
+  [[ "${#production_transition_staged_compose_removal_approvals[@]}" -eq 0 ]] ||
+    staged_approvals="$(join_approval_audit_records "${production_transition_staged_compose_removal_approvals[@]}")"
+  [[ "${#production_transition_consumed_compose_removal_approvals[@]}" -eq 0 ]] ||
+    consumed_approvals="$(join_approval_audit_records "${production_transition_consumed_compose_removal_approvals[@]}")"
+  [[ "${#production_transition_revoked_compose_removal_approvals[@]}" -eq 0 ]] ||
+    revoked_approvals="$(join_approval_audit_records "${production_transition_revoked_compose_removal_approvals[@]}")"
+
+  release_record="$backup_dir/release-$release_started_at-$release_short_sha.txt"
+  temp_record="$release_record.tmp.$$"
+  {
+    printf 'outcome=%s\n' "$outcome"
+    printf 'timestamp_utc=%s\n' "$release_started_at"
+    printf 'operator=%s\n' "$(id -un)"
+    printf 'current_sha=%s\n' "${current_sha:-unknown}"
+    printf 'candidate_sha=%s\n' "$release_sha"
+    printf 'previous_release_path=%s\n' "${previous_release_dir:-unknown}"
+    printf 'candidate_release_path=%s\n' "${release_dir:-unknown}"
+    printf 'previous_image=%s\n' "${previous_web_image:-unknown}"
+    printf 'candidate_image=al-lio-web:%s\n' "$release_sha"
+    printf 'policy_result=%s\n' "$policy_result"
+    printf 'historical_exception=none\n'
+    printf 'staged_approvals=%s\n' "$staged_approvals"
+    printf 'consumed_approvals=%s\n' "$consumed_approvals"
+    printf 'revoked_approvals=%s\n' "$revoked_approvals"
+    printf 'compose_env_additions=%s\n' "${production_transition_allowed_compose_additions[*]:-none}"
+    printf 'compose_env_removals=%s\n' "${production_transition_allowed_compose_removals[*]:-none}"
+    printf 'migration_required=%s\n' "${migration_required:-0}"
+    printf 'pending_migration_ids=%s\n' "$pending_migration_ids"
+    printf 'applied_migration_ids=%s\n' "$applied_migration_ids"
+    printf 'db_backup_path=%s\n' "${postgres_backup_file:-not-required}"
+    printf 'db_backup_checksum=%s\n' "$postgres_backup_checksum"
+    printf 'restore_verification=%s\n' "$restore_verification_result"
+    printf 'rehearsal=%s\n' "$rehearsal_result"
+    printf 'radar_backup=%s\n' "${radar_backup_file:-not-required}"
+    printf 'radar_backup_status=%s\n' "$radar_backup_status"
+    printf 'internal_health=%s\n' "$internal_health_result"
+    printf 'internal_ready=%s\n' "$internal_readiness_result"
+    printf 'internal_version=%s\n' "$internal_version_result"
+    printf 'public_health=%s\n' "$public_health_result"
+    printf 'public_ready=%s\n' "$public_readiness_result"
+    printf 'public_version=%s\n' "$public_version_result"
+    printf 'automated_smoke=%s\n' "$automated_smoke_result"
+    printf 'functional_smoke=%s\n' "$functional_smoke_result"
+    printf 'postgres_container_preserved=%s\n' "$postgres_container_preserved"
+    printf 'radar_container_preserved=%s\n' "$radar_container_preserved"
+    printf 'rollback_release_path=%s\n' "${previous_release_dir:-unknown}"
+    printf 'rollback_image=%s\n' "${previous_web_image:-unknown}"
+    printf 'rollback_result=%s\n' "$rollback_result"
+  } > "$temp_record"
+  chmod 600 "$temp_record"
+  mv -- "$temp_record" "$release_record"
+  release_record_written=1
 }
 
 container_status() {
@@ -110,6 +223,28 @@ container_status() {
 
 container_health() {
   docker inspect "$1" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
+}
+
+assert_preserved_container_identity() {
+  local container_name="$1"
+  local expected_id="$2"
+  local label="$3"
+  local phase="$4"
+  local actual_id=""
+
+  [[ -n "$expected_id" ]] || fail "$label container identity was not captured before $phase."
+  actual_id="$(docker inspect "$container_name" --format '{{.Id}}' 2>/dev/null || true)"
+  [[ -n "$actual_id" ]] || fail "$label container is unavailable before $phase."
+  [[ "$actual_id" == "$expected_id" ]] ||
+    fail "$label container identity changed before $phase."
+}
+
+assert_postgres_identity() {
+  assert_preserved_container_identity "$POSTGRES_CONTAINER" "$postgres_container_id" "PostgreSQL" "$1"
+}
+
+assert_radar_identity() {
+  assert_preserved_container_identity "$RADAR_CONTAINER" "$radar_container_id" "Radar" "$1"
 }
 
 wait_for_web_health() {
@@ -133,15 +268,24 @@ wait_for_web_health() {
 }
 
 drop_rehearsal_database() {
+  local current_postgres_id=""
+
   if [[ -n "$rehearsal_database" ]]; then
-    docker exec "$POSTGRES_CONTAINER" dropdb -U al_lio --if-exists "$rehearsal_database" >/dev/null 2>&1 || true
+    current_postgres_id="$(docker inspect "$POSTGRES_CONTAINER" --format '{{.Id}}' 2>/dev/null || true)"
+    if [[ -n "$postgres_container_id" && "$current_postgres_id" == "$postgres_container_id" ]]; then
+      docker exec "$postgres_container_id" dropdb -U al_lio --if-exists "$rehearsal_database" >/dev/null 2>&1 || true
+    fi
     rehearsal_database=""
   fi
 }
 
 restart_preserved_radar() {
+  local current_radar_id=""
+
   if [[ "$radar_stopped" -eq 1 ]]; then
-    docker start "$RADAR_CONTAINER" >/dev/null || return 1
+    current_radar_id="$(docker inspect "$RADAR_CONTAINER" --format '{{.Id}}' 2>/dev/null || true)"
+    [[ -n "$radar_container_id" && "$current_radar_id" == "$radar_container_id" ]] || return 1
+    docker start "$radar_container_id" >/dev/null || return 1
     radar_stopped=0
   fi
 }
@@ -166,8 +310,10 @@ on_exit() {
 
   if [[ "$status" -ne 0 && "$web_replacement_started" -eq 1 ]]; then
     if rollback_web; then
+      rollback_result="completed"
       printf 'Rollback completed: %s is healthy again.\n' "$previous_web_image" >&2
     else
+      rollback_result="failed"
       printf 'CRITICAL: automatic web rollback did not become healthy. Follow docs/operations/DEPLOY_VPS.md.\n' >&2
     fi
   fi
@@ -181,6 +327,10 @@ on_exit() {
   fi
 
   if [[ "$status" -ne 0 ]]; then
+    if [[ -n "$release_started_at" && "$release_record_written" -eq 0 ]]; then
+      write_release_record "failed" ||
+        printf 'CRITICAL: failed to write the private failed-release record.\n' >&2
+    fi
     printf 'Deployment stopped with status %s. Production was not declared successful.\n' "$status" >&2
   fi
 
@@ -208,7 +358,7 @@ release_short_sha="${release_sha:0:12}"
 [[ "$health_attempts" =~ ^[1-9][0-9]*$ ]] || fail "AL_LIO_HEALTH_ATTEMPTS must be a positive integer."
 [[ "$health_interval_seconds" =~ ^[1-9][0-9]*$ ]] || fail "AL_LIO_HEALTH_INTERVAL_SECONDS must be a positive integer."
 
-for command_name in git docker curl flock awk grep install readlink sha256sum tar; do
+for command_name in git docker curl flock awk grep install readlink sha256sum tar mktemp od timeout tr wc; do
   require_command "$command_name"
 done
 
@@ -251,61 +401,32 @@ case "$previous_release_dir" in
   *) fail "Current release directory is outside $releases_dir: $previous_release_dir" ;;
 esac
 [[ -f "$previous_release_dir/.env" ]] || fail "Current production .env not found in $previous_release_dir"
+validate_release_worktree_integrity "$previous_release_dir" "$current_sha" ||
+  fail "Current release integrity check failed: $release_worktree_integrity_error"
+[[ "$(read_env_value AL_LIO_IMAGE_TAG "$previous_release_dir/.env")" == "$current_sha" ]] ||
+  fail "Current release AL_LIO_IMAGE_TAG does not match the running image SHA."
+[[ "$(read_env_value AL_LIO_RELEASE_SHA "$previous_release_dir/.env")" == "$current_sha" ]] ||
+  fail "Current release AL_LIO_RELEASE_SHA does not match the running image SHA."
 
 base_url="$(read_env_value BASE_URL "$previous_release_dir/.env")"
 [[ "$base_url" == https://* ]] || fail "BASE_URL must use HTTPS."
 
 log "Fetching origin/main and validating the requested release"
 git -C "$repository_dir" fetch --tags origin main
-git -C "$repository_dir" cat-file -e "${release_sha}^{commit}" 2>/dev/null || fail "Commit does not exist after fetching origin/main: $release_sha"
-git -C "$repository_dir" merge-base --is-ancestor "$release_sha" origin/main || fail "The requested commit is not reachable from origin/main."
-git -C "$repository_dir" merge-base --is-ancestor "$current_sha" "$release_sha" || fail "The requested commit would be a downgrade or divergent release. Use the rollback runbook instead."
 
 if [[ "$release_sha" == "$current_sha" ]]; then
-  curl -fsS "$base_url/api/health" >/dev/null
-  curl -fsS "$base_url/api/ready" >/dev/null
+  curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/health" >/dev/null
+  curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/ready" >/dev/null
+  [[ "$(curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/version")" == "{\"releaseSha\":\"$release_sha\"}" ]] ||
+    fail "The public release identity does not match the running image."
   printf 'AL-LIO is already running %s and is healthy.\n' "$release_sha"
   exit 0
 fi
 
-blocked_runtime_changes="$(git -C "$repository_dir" diff --name-only "$current_sha" "$release_sha" -- \
-  infra/Dockerfile data/learning-competencies.json scripts/import-learning-competencies.mjs)"
-if [[ -n "$blocked_runtime_changes" ]]; then
-  printf '%s\n' "$blocked_runtime_changes" >&2
-  fail "This release changes infrastructure or an operator-managed catalogue. Follow docs/operations/DEPLOY_VPS.md manually."
-fi
-
-if ! git -C "$repository_dir" diff --quiet "$current_sha" "$release_sha" -- "$COMPOSE_FILE"; then
-  validate_compose_env_additions ||
-    fail "Docker Compose changed outside the allowlisted service environment passthroughs. Follow docs/operations/DEPLOY_VPS.md manually."
-fi
-
-migration_changes="$(git -C "$repository_dir" diff --name-status "$current_sha" "$release_sha" -- infra/postgres/migrations)"
-added_migrations=()
-if [[ -n "$migration_changes" ]]; then
-  while IFS=$'\t' read -r change_status migration_path extra_path; do
-    [[ -n "$change_status" ]] || continue
-    [[ "$change_status" == "A" && -z "${extra_path:-}" ]] || fail "Applied migration history changed ($change_status $migration_path). Existing migrations are immutable."
-    [[ "$migration_path" == infra/postgres/migrations/*.sql ]] || fail "Unexpected migration file: $migration_path"
-    migration_sql="$(git -C "$repository_dir" show "$release_sha:$migration_path")"
-    if grep -Eiq '(^|[^[:alnum:]_])(drop[[:space:]]+(table|schema|column|index)|truncate[[:space:]]+table|delete[[:space:]]+from|alter[[:space:]]+table[^;]*(drop[[:space:]]+column|alter[[:space:]]+column|rename[[:space:]]))([^[:alnum:]_]|$)' <<< "$migration_sql"; then
-      fail "Migration $migration_path contains a destructive or structural statement that requires the manual runbook."
-    fi
-    added_migrations+=("$migration_path")
-  done <<< "$migration_changes"
-fi
-
-printf '\nCurrent release: %s\nRequested release: %s\n' "$current_sha" "$release_sha"
-if [[ "${#allowed_compose_env_mappings[@]}" -gt 0 ]]; then
-  printf 'Allowlisted service environment additions (inactive until configured):\n'
-  printf '  - %s\n' "${allowed_compose_env_mappings[@]}"
-fi
-if [[ "${#added_migrations[@]}" -gt 0 ]]; then
-  printf 'New additive migrations:\n'
-  printf '  - %s\n' "${added_migrations[@]}"
-else
-  printf 'New migrations: none\n'
-fi
+validate_production_transition "$repository_dir" "$current_sha" "$release_sha" origin/main ||
+  fail "$production_transition_error"
+policy_result="accepted"
+print_production_transition_summary "$current_sha" "$release_sha"
 
 if [[ -t 0 ]]; then
   read -r -p "Type DEPLOY ${release_short_sha} to continue: " confirmation
@@ -331,44 +452,65 @@ else
   umask "$private_umask"
 fi
 
-[[ -z "$(git -C "$release_dir" status --porcelain --untracked-files=no)" ]] || fail "Release worktree is not clean: $release_dir"
-install -m 600 "$previous_release_dir/.env" "$release_dir/.env"
-write_env_value AL_LIO_IMAGE_TAG "$release_sha" "$release_dir/.env"
+validate_release_worktree_integrity "$release_dir" "$release_sha" ||
+  fail "$release_worktree_integrity_error"
+bash "$(dirname "${BASH_SOURCE[0]}")/prepare-release-env.sh" \
+  "$previous_release_dir/.env" \
+  "$release_dir/.env" \
+  "$release_sha"
 
 compose=(docker compose -f "$release_dir/$COMPOSE_FILE" --env-file "$release_dir/.env")
 "${compose[@]}" config --quiet
+validate_release_worktree_integrity "$release_dir" "$release_sha" ||
+  fail "Candidate integrity check failed before build: $release_worktree_integrity_error"
 
 release_started_at="$(date -u +%Y%m%dT%H%M%SZ)"
 printf '%s\n' "$previous_web_image" > "$backup_dir/previous-web-image-$release_started_at.txt"
 docker inspect "$RADAR_CONTAINER" --format '{{.Config.Image}}' > "$backup_dir/previous-radar-image-$release_started_at.txt"
 postgres_container_id="$(docker inspect "$POSTGRES_CONTAINER" --format '{{.Id}}')"
 radar_container_id="$(docker inspect "$RADAR_CONTAINER" --format '{{.Id}}')"
+[[ -n "$postgres_container_id" && -n "$radar_container_id" ]] ||
+  fail "Could not capture preserved PostgreSQL/Radar container identities."
 
 log "Building candidate image without stopping production"
 "${compose[@]}" build --pull al_lio_web
 docker image inspect "al-lio-web:$release_sha" >/dev/null
 
 log "Auditing production migration state with the candidate image"
+assert_postgres_identity "candidate migration baseline audit"
 audit_output="$("${compose[@]}" --profile ops run --rm -T al_lio_migrator node scripts/postgres/audit-baseline.mjs </dev/null)"
 printf '%s\n' "$audit_output"
+assert_postgres_identity "candidate migration status inspection"
 migration_status_output="$("${compose[@]}" --profile ops run --rm -T al_lio_migrator node scripts/postgres/migrate.mjs --status </dev/null)"
 printf '%s\n' "$migration_status_output"
 
 migration_required=0
 if grep -q 'PENDIENTE' <<< "$migration_status_output"; then
   migration_required=1
+  pending_migration_ids="$(awk '$1 == "PENDIENTE" { value = value (value ? "," : "") $2 } END { print value }' <<< "$migration_status_output")"
+  [[ -n "$pending_migration_ids" ]] || fail "Migrator reported pending work without migration identifiers."
 fi
 
 if [[ "$migration_required" -eq 1 ]]; then
   log "Creating and restore-testing the PostgreSQL backup"
-  AL_LIO_BACKUP_DIR="$backup_dir" bash "$release_dir/scripts/postgres/backup-production.sh"
-  postgres_backup_file="$(ls -1t "$backup_dir"/al_lio_*.dump | head -n 1)"
-  bash "$release_dir/scripts/postgres/verify-backup-production.sh" "$postgres_backup_file"
+  assert_postgres_identity "production backup"
+  backup_output="$(
+    AL_LIO_POSTGRES_CONTAINER="$postgres_container_id" \
+      AL_LIO_BACKUP_DIR="$backup_dir" \
+      bash "$release_dir/scripts/postgres/backup-production.sh"
+  )"
+  printf '%s\n' "$backup_output"
+  validate_postgres_backup_output "$backup_output"
+  assert_postgres_identity "backup restore verification"
+  AL_LIO_POSTGRES_CONTAINER="$postgres_container_id" \
+    bash "$release_dir/scripts/postgres/verify-backup-production.sh" "$postgres_backup_file"
+  restore_verification_result="passed"
 
   log "Rehearsing all pending migrations on an isolated restored database"
+  assert_postgres_identity "migration rehearsal database creation"
   rehearsal_database="al_lio_rehearsal_${release_short_sha}_$$"
-  docker exec "$POSTGRES_CONTAINER" createdb -U al_lio "$rehearsal_database"
-  docker exec -i "$POSTGRES_CONTAINER" pg_restore \
+  docker exec "$postgres_container_id" createdb -U al_lio "$rehearsal_database"
+  docker exec -i "$postgres_container_id" pg_restore \
     -U al_lio \
     -d "$rehearsal_database" \
     --exit-on-error \
@@ -383,6 +525,7 @@ if [[ "$migration_required" -eq 1 ]]; then
   fi
   [[ "$migration_url_without_query" == */* ]] || fail "DATABASE_MIGRATION_URL is not a PostgreSQL URL."
   export DATABASE_MIGRATION_URL="${migration_url_without_query%/*}/${rehearsal_database}${migration_url_query}"
+  assert_postgres_identity "migration rehearsal"
   "${compose[@]}" --profile ops run --rm -T -e DATABASE_MIGRATION_URL al_lio_migrator </dev/null
   unset DATABASE_MIGRATION_URL
 
@@ -392,12 +535,15 @@ if [[ "$migration_required" -eq 1 ]]; then
   # always off by one as soon as a real pending migration is rehearsed.
   migration_file_count="$(find "$release_dir/infra/postgres/migrations" -maxdepth 1 -type f -name '*.sql' | wc -l | tr -d '[:space:]')"
   expected_migration_count="$((migration_file_count + 1))"
-  rehearsal_migration_count="$(docker exec "$POSTGRES_CONTAINER" psql -U al_lio -d "$rehearsal_database" -Atc 'select count(*) from public.schema_migrations;')"
+  assert_postgres_identity "migration rehearsal ledger verification"
+  rehearsal_migration_count="$(docker exec "$postgres_container_id" psql -U al_lio -d "$rehearsal_database" -Atc 'select count(*) from public.schema_migrations;')"
   [[ "$rehearsal_migration_count" == "$expected_migration_count" ]] || fail "Migration rehearsal ended with $rehearsal_migration_count/$expected_migration_count migrations."
+  rehearsal_result="passed"
   drop_rehearsal_database
 
   log "Stopping and backing up the preserved Radar writer"
-  docker stop --time 30 "$RADAR_CONTAINER" >/dev/null
+  assert_radar_identity "Radar writer stop"
+  docker stop --time 30 "$radar_container_id" >/dev/null
   radar_stopped=1
   radar_backup_file="$backup_dir/radar-data-$release_started_at.tgz"
   docker run --rm \
@@ -410,15 +556,30 @@ if [[ "$migration_required" -eq 1 ]]; then
   [[ -s "$radar_backup_file" ]] || fail "Radar backup is empty."
   chmod 600 "$radar_backup_file"
   sha256sum "$radar_backup_file" > "$radar_backup_file.sha256"
+  radar_backup_status="verified"
 
   log "Applying rehearsed migrations to production"
+  assert_postgres_identity "production migration baseline audit"
+  assert_radar_identity "production migration baseline audit"
   "${compose[@]}" --profile ops run --rm -T al_lio_migrator node scripts/postgres/audit-baseline.mjs </dev/null
+  assert_postgres_identity "production migrations"
+  assert_radar_identity "production migrations"
   "${compose[@]}" --profile ops run --rm -T al_lio_migrator </dev/null
-  production_migration_count="$(docker exec "$POSTGRES_CONTAINER" psql -U al_lio -d al_lio -Atc 'select count(*) from public.schema_migrations;')"
+  assert_postgres_identity "production migration ledger verification"
+  production_migration_count="$(docker exec "$postgres_container_id" psql -U al_lio -d al_lio -Atc 'select count(*) from public.schema_migrations;')"
   [[ "$production_migration_count" == "$expected_migration_count" ]] || fail "Production ended with $production_migration_count/$expected_migration_count migrations."
+  applied_migration_ids="$pending_migration_ids"
 fi
 
 log "Replacing only the web service"
+[[ "$(read_env_value AL_LIO_IMAGE_TAG "$release_dir/.env")" == "$release_sha" ]] ||
+  fail "Candidate AL_LIO_IMAGE_TAG changed before cutover."
+[[ "$(read_env_value AL_LIO_RELEASE_SHA "$release_dir/.env")" == "$release_sha" ]] ||
+  fail "Candidate AL_LIO_RELEASE_SHA changed before cutover."
+validate_release_worktree_integrity "$release_dir" "$release_sha" ||
+  fail "Candidate integrity check failed before cutover: $release_worktree_integrity_error"
+assert_postgres_identity "web cutover"
+assert_radar_identity "web cutover"
 web_replacement_started=1
 "${compose[@]}" up -d --no-deps al_lio_web </dev/null
 
@@ -427,36 +588,36 @@ if ! wait_for_web_health; then
 fi
 
 [[ "$(docker inspect "$WEB_CONTAINER" --format '{{.Config.Image}}')" == "al-lio-web:$release_sha" ]] || fail "The running web image does not match the requested release."
-docker exec "$WEB_CONTAINER" wget -qO- http://127.0.0.1:3000/api/health >/dev/null
-docker exec "$WEB_CONTAINER" wget -qO- http://127.0.0.1:3000/api/ready >/dev/null
-curl -fsS "$base_url/api/health" >/dev/null
-curl -fsS "$base_url/api/ready" >/dev/null
-unauthenticated_radar_status="$(curl -sS -o /dev/null -w '%{http_code}' "$base_url/api/job-radar")"
+timeout 20s docker exec "$WEB_CONTAINER" wget -T 5 -qO- http://127.0.0.1:3000/api/health >/dev/null
+internal_health_result="passed"
+timeout 20s docker exec "$WEB_CONTAINER" wget -T 5 -qO- http://127.0.0.1:3000/api/ready >/dev/null
+internal_readiness_result="passed"
+[[ "$(timeout 20s docker exec "$WEB_CONTAINER" wget -T 5 -qO- http://127.0.0.1:3000/api/version)" == "{\"releaseSha\":\"$release_sha\"}" ]] ||
+  fail "The internal release identity does not match the requested release."
+internal_version_result="$release_sha"
+curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/health" >/dev/null
+public_health_result="passed"
+curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/ready" >/dev/null
+public_readiness_result="passed"
+[[ "$(curl -fsS --connect-timeout 5 --max-time 20 "$base_url/api/version")" == "{\"releaseSha\":\"$release_sha\"}" ]] ||
+  fail "The public release identity does not match the requested release."
+public_version_result="$release_sha"
+unauthenticated_radar_status="$(curl -sS --connect-timeout 5 --max-time 20 -o /dev/null -w '%{http_code}' "$base_url/api/job-radar")"
 [[ "$unauthenticated_radar_status" == "401" ]] || fail "Unauthenticated /api/job-radar returned HTTP $unauthenticated_radar_status instead of 401."
+automated_smoke_result="passed"
 
-[[ "$(docker inspect "$POSTGRES_CONTAINER" --format '{{.Id}}')" == "$postgres_container_id" ]] || fail "PostgreSQL container identity changed unexpectedly."
-[[ "$(docker inspect "$RADAR_CONTAINER" --format '{{.Id}}')" == "$radar_container_id" ]] || fail "Radar container identity changed unexpectedly."
+assert_postgres_identity "final preservation verification"
+postgres_container_preserved="true"
+assert_radar_identity "final preservation verification"
+radar_container_preserved="true"
 
 if [[ "$radar_stopped" -eq 1 ]]; then
   restart_preserved_radar || fail "Radar could not be restarted after the web became healthy."
 fi
-[[ "$(container_status "$RADAR_CONTAINER")" == "running" ]] || fail "Radar is not running after deployment."
+assert_radar_identity "post-deployment Radar status verification"
+[[ "$(container_status "$radar_container_id")" == "running" ]] || fail "Radar is not running after deployment."
 
-release_record="$backup_dir/release-$release_started_at-$release_short_sha.txt"
-{
-  printf 'outcome=approved\n'
-  printf 'release_sha=%s\n' "$release_sha"
-  printf 'previous_web_image=%s\n' "$previous_web_image"
-  printf 'deployed_web_image=al-lio-web:%s\n' "$release_sha"
-  printf 'postgres_backup=%s\n' "${postgres_backup_file:-not-required}"
-  printf 'radar_backup=%s\n' "${radar_backup_file:-not-required}"
-  printf 'migration_required=%s\n' "$migration_required"
-  printf 'public_health=ok\n'
-  printf 'public_readiness=ok\n'
-  printf 'postgres_container_preserved=true\n'
-  printf 'radar_container_preserved=true\n'
-} > "$release_record"
-chmod 600 "$release_record"
+write_release_record "approved"
 
 web_replacement_started=0
 
