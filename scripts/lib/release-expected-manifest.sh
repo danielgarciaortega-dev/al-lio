@@ -52,7 +52,6 @@ build_expected_release_manifest() {
   local extra_metadata=""
   local parent=""
   local parse_error=""
-  local trusted_utility=""
   local -a manifest_records=()
 
   release_worktree_integrity_error=""
@@ -62,12 +61,10 @@ build_expected_release_manifest() {
     release_worktree_integrity_error="Expected-manifest builder requires the trusted release-integrity primitives."
     return 1
   }
-  for trusted_utility in /usr/bin/sort; do
-    [[ -x "$trusted_utility" ]] || {
-      release_worktree_integrity_error="Required trusted manifest utility is unavailable: $trusted_utility"
-      return 1
-    }
-  done
+  [[ -x /usr/bin/sort ]] || {
+    release_worktree_integrity_error="Required trusted manifest utility is unavailable: /usr/bin/sort"
+    return 1
+  }
 
   validate_release_commit_identity "$repository_dir" "$expected_sha" || return 1
 
