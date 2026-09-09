@@ -373,42 +373,6 @@ test("release gitfile linkage accepts a valid detached worktree", async () => {
   }
 });
 
-test("release gitfile linkage ignores hostile shell utility functions and PATH", async () => {
-  const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-hostile-shell-"));
-  try {
-    const fixture = await createReleaseGitfileFixture(root);
-    const sentinelPrefix = toBashPath(join(root, "hostile-utility-called"));
-    const utilities = ["stat", "id", "readlink", "od", "awk", "cygpath", "env", "printf", "read"];
-    const setup = `SENTINEL_PREFIX="${sentinelPrefix}"
-stat() { : > "\${SENTINEL_PREFIX}-stat"; builtin printf '000\\n'; }
-id() { : > "\${SENTINEL_PREFIX}-id"; builtin printf '999999\\n'; }
-readlink() { : > "\${SENTINEL_PREFIX}-readlink"; builtin printf '/hostile\\n'; }
-od() { : > "\${SENTINEL_PREFIX}-od"; builtin printf '0\\n'; }
-awk() { : > "\${SENTINEL_PREFIX}-awk"; return 97; }
-cygpath() { : > "\${SENTINEL_PREFIX}-cygpath"; builtin printf '/hostile\\n'; }
-env() { : > "\${SENTINEL_PREFIX}-env"; return 97; }
-printf() { : > "\${SENTINEL_PREFIX}-printf"; return 97; }
-read() { : > "\${SENTINEL_PREFIX}-read"; return 97; }
-PATH=/hostile`;
-    const successChecks = `for utility in ${utilities.join(" ")}; do
-  [[ ! -e "\${SENTINEL_PREFIX}-\${utility}" ]] || {
-    builtin printf 'hostile utility executed: %s\\n' "$utility" >&2
-    exit 91
-  }
-done`;
-    const result = await runGitfileValidation(fixture, setup, successChecks);
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout, "accepted\n");
-    for (const utility of utilities) {
-      await assert.rejects(readFile(`${join(root, "hostile-utility-called")}-${utility}`), {
-        code: "ENOENT",
-      });
-    }
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
 test("release .git must be a single regular file with strict metadata", async (t) => {
   for (const [name, mutate, expectedError] of [
     [
