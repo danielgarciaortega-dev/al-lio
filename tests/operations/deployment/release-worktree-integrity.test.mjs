@@ -20,6 +20,14 @@ const integrityHelperUrl = new URL(
   "../../../scripts/lib/release-worktree-integrity.sh",
   import.meta.url,
 );
+const expectedManifestHelperUrl = new URL(
+  "../../../scripts/lib/release-expected-manifest.sh",
+  import.meta.url,
+);
+const physicalTopologyHelperUrl = new URL(
+  "../../../scripts/lib/release-physical-topology.sh",
+  import.meta.url,
+);
 const bashPath = process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash";
 
 function toBashPath(path) {
@@ -62,13 +70,15 @@ async function createRepository(root, name, contents) {
 }
 
 async function runHelper(repository, script, env = {}) {
-  const helperPath = toBashPath(fileURLToPath(integrityHelperUrl));
+  const sources = [integrityHelperUrl, expectedManifestHelperUrl, physicalTopologyHelperUrl]
+    .map((url) => `source "${toBashPath(fileURLToPath(url))}"`)
+    .join("\n");
   const repositoryPath = toBashPath(repository);
   return spawnSync(bashPath, ["-s"], {
     encoding: "utf8",
     env: { ...process.env, ...env },
     input: `set -Eeuo pipefail
-source "${helperPath}"
+${sources}
 REPOSITORY="${repositoryPath}"
 ${script}
 `,
@@ -104,6 +114,37 @@ async function createReleaseGitfileFixture(root) {
     gitfile,
     linkedGitdir: rawGitdir.replaceAll("/", process.platform === "win32" ? "\\" : "/"),
   };
+}
+
+async function createTopologyFixture(root) {
+  const fixture = await createRepository(root, "canonical", "trusted\n");
+  await write(fixture.repository, ".gitignore", ".ignored\n");
+  await write(fixture.repository, "nested/tracked.txt", "nested\n");
+  if (process.platform !== "win32") {
+    await write(fixture.repository, "tab\tname.txt", "tab\n");
+    await write(fixture.repository, "line\nname.txt", "line\n");
+    await write(fixture.repository, "run.sh", "#!/bin/sh\nexit 0\n");
+    await chmod(join(fixture.repository, "run.sh"), 0o755);
+  }
+  fixture.commitSha = await commitAll(fixture.repository, "topology fixture");
+  fixture.release = join(root, "release");
+  git(fixture.repository, ["worktree", "add", "--quiet", "--detach", fixture.release, fixture.commitSha]);
+  return fixture;
+}
+
+async function runTopologyValidation(fixture, deterministic = false) {
+  return runHelper(fixture.repository, `
+RELEASE="${toBashPath(fixture.release)}"
+if validate_release_physical_topology "$REPOSITORY" "$RELEASE" "${fixture.commitSha}"${
+  deterministic
+    ? " && /usr/bin/cmp -s <(build_actual_release_topology_manifest \"$RELEASE\") <(build_actual_release_topology_manifest \"$RELEASE\")"
+    : ""
+}; then
+  printf 'accepted\\n'
+else
+  printf 'rejected=%s\\n' "$release_worktree_integrity_error" >&2
+  exit 1
+fi`);
 }
 
 async function runGitfileValidation(fixture, setup = "", successChecks = "") {
@@ -575,4 +616,81 @@ test("the trusted commit boundary never executes Git against release-local state
   assert.match(boundary, /--no-replace-objects/);
   assert.match(boundary, /LC_ALL=C/);
   assert.match(boundary, /GIT_TERMINAL_PROMPT=0/);
+});
+
+test("physical topology accepts only the exact non-followed candidate tree", async (t) => {
+  const cases = [
+    ["extra file", (f) => writeFile(join(f.release, "extra.txt"), "extra"), /does not exactly match/],
+    ["ignored file", (f) => writeFile(join(f.release, ".ignored"), "ignored"), /does not exactly match/],
+    ["extra empty directory", (f) => mkdir(join(f.release, "empty")), /does not exactly match/],
+    ["missing tracked file", (f) => rm(join(f.release, "marker.txt")), /does not exactly match/],
+    ["file replaced by directory", async (f) => {
+      await rm(join(f.release, "marker.txt"));
+      await mkdir(join(f.release, "marker.txt"));
+    }, /does not exactly match/],
+    ["hardlinked tracked file", (f) => link(join(f.release, "marker.txt"), join(f.release, "hardlink")), /one hard link/],
+    ["tracked symlink", async (f) => {
+      await rm(join(f.release, "marker.txt"));
+      await createFileSymlink(join(f.release, "nested", "tracked.txt"), join(f.release, "marker.txt"));
+    }, /unsupported physical type/],
+    ["parent symlink", async (f) => {
+      const outside = join(dirname(f.release), "outside");
+      await rename(join(f.release, "nested"), outside);
+      await symlink(outside, join(f.release, "nested"), process.platform === "win32" ? "junction" : "dir");
+    }, /unsupported physical type/],
+    ["env directory", (f) => mkdir(join(f.release, ".env")), /Release \.env/],
+    ["env symlink", async (f) => {
+      const outside = join(dirname(f.release), "outside-env");
+      await writeFile(outside, "SAFE=fixture\n");
+      await createFileSymlink(outside, join(f.release, ".env"));
+    }, /Release \.env/],
+    ["env hardlink", async (f) => {
+      await writeFile(join(f.release, ".env"), "SAFE=fixture\n");
+      await chmod(join(f.release, ".env"), 0o600);
+      await link(join(f.release, ".env"), join(dirname(f.release), "env-link"));
+    }, /Release \.env/],
+  ];
+  if (process.platform !== "win32") {
+    cases.push(
+      ["FIFO", (f) => spawnSync("mkfifo", [join(f.release, "pipe")]), /unsupported physical type/],
+      ["wrong root mode", (f) => chmod(f.release, 0o700), /Release root/],
+      ["wrong directory mode", (f) => chmod(join(f.release, "nested"), 0o700), /Release directory/],
+      ["wrong file mode", (f) => chmod(join(f.release, "marker.txt"), 0o600), /unsupported mode/],
+      ["file special bits", (f) => chmod(join(f.release, "marker.txt"), 0o4644), /unsupported mode/],
+      ["wrong env mode", (f) => writeFile(join(f.release, ".env"), "SAFE=fixture\n"), /Release \.env/],
+      ["valid private env", async (f) => {
+        await writeFile(join(f.release, ".env"), "SAFE=fixture\n");
+        await chmod(join(f.release, ".env"), 0o600);
+      }, null],
+    );
+  }
+
+  await t.test("valid tree and deterministic manifest", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-topology-valid-"));
+    try {
+      const result = await runTopologyValidation(await createTopologyFixture(root), true);
+      assert.equal(result.status, 0, result.stderr);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  for (const [name, mutate, expectedError] of cases) {
+    await t.test(name, async () => {
+      const root = await mkdtemp(join(tmpdir(), "al-lio-release-topology-case-"));
+      try {
+        const fixture = await createTopologyFixture(root);
+        const mutation = await mutate(fixture);
+        if (mutation?.error) throw mutation.error;
+        const result = await runTopologyValidation(fixture);
+        if (expectedError) {
+          assert.notEqual(result.status, 0, `${name} unexpectedly passed`);
+          assert.match(result.stderr, expectedError);
+        } else {
+          assert.equal(result.status, 0, result.stderr);
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
 });
