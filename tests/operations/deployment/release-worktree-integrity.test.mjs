@@ -652,7 +652,7 @@ test("physical topology accepts only the exact non-followed candidate tree", asy
   ];
   if (process.platform !== "win32") {
     cases.push(
-      ["FIFO", (f) => spawnSync("mkfifo", [join(f.release, "pipe")]), /unsupported physical type/],
+      ["FIFO", (f) => spawnSync(bashPath, ["-lc", `/usr/bin/mkfifo -- ${quoteBashPath(join(f.release, "pipe"))}`]), /unsupported physical type/],
       ["wrong root mode", (f) => chmod(f.release, 0o700), /Release root/],
       ["wrong directory mode", (f) => chmod(join(f.release, "nested"), 0o700), /Release directory/],
       ["wrong file mode", (f) => chmod(join(f.release, "marker.txt"), 0o600), /unsupported mode/],
