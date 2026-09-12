@@ -63,6 +63,16 @@ function commitEntries(repository, entries, message = "fixture tree") {
   return git(repository, ["commit-tree", tree, "-m", message]);
 }
 
+function commitRootEntries(repository, entries, message = "fixture tree") {
+  const treeInput = Buffer.concat(
+    entries.map(({ mode, objectId, path }) =>
+      Buffer.from(`${mode} blob ${objectId}\t${path}\0`),
+    ),
+  );
+  const tree = git(repository, ["mktree", "-z"], { input: treeInput });
+  return git(repository, ["commit-tree", tree, "-m", message]);
+}
+
 function runManifest(repository, commitSha, env = {}) {
   const integrityHelper = toBashPath(fileURLToPath(integrityHelperUrl));
   const manifestHelper = toBashPath(fileURLToPath(manifestHelperUrl));
@@ -70,7 +80,7 @@ function runManifest(repository, commitSha, env = {}) {
   return spawnSync(bashPath, ["-s"], {
     encoding: null,
     env: { ...process.env, ...env },
-    input: `set -Eeuo pipefail\nsource "${integrityHelper}"\nsource "${manifestHelper}"\nbuild_expected_release_manifest "${repositoryPath}" "${commitSha}"\n`,
+    input: `set -Eeuo pipefail\nsource "${integrityHelper}"\nsource "${manifestHelper}"\nif ! build_expected_release_manifest "${repositoryPath}" "${commitSha}"; then\n  printf '%s\\n' "$release_worktree_integrity_error" >&2\n  exit 1\nfi\n`,
   });
 }
 
@@ -124,9 +134,9 @@ test("expected manifest is deterministic, NUL-delimited, and preserves regular f
       directoryRecord("bin"),
       directoryRecord("docs"),
       directoryRecord("docs/nested"),
-      fileRecord("100755", scriptBlob, "bin/run.sh"),
       fileRecord("100644", nestedBlob, "docs/nested/read me.txt"),
       fileRecord("100644", rootBlob, "root.txt"),
+      fileRecord("100755", scriptBlob, "bin/run.sh"),
     ]);
     assert.equal(records.filter((record) => record === directoryRecord("docs")).length, 1);
   } finally {
@@ -140,12 +150,12 @@ test("expected manifest preserves TAB, newline, spaces, and shell metacharacters
     const repository = await createRepository(root);
     const blob = hashBlob(repository, "content\n");
     const paths = [
-      "tabs/name\twith-tab.txt",
-      "lines/name\nwith-newline.txt",
-      "meta/$HOME;$(echo nope) [file].txt",
-      "spaces/two words.txt",
+      "name\twith-tab.txt",
+      "name\nwith-newline.txt",
+      "$HOME;$(echo nope) [file].txt",
+      "two words.txt",
     ];
-    const commitSha = commitEntries(
+    const commitSha = commitRootEntries(
       repository,
       paths.map((path) => ({ mode: "100644", objectId: blob, path })),
       "special path tree",
