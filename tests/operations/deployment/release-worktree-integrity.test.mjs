@@ -28,6 +28,10 @@ const physicalTopologyHelperUrl = new URL(
   "../../../scripts/lib/release-physical-topology.sh",
   import.meta.url,
 );
+const physicalBlobHelperUrl = new URL(
+  "../../../scripts/lib/release-physical-blobs.sh",
+  import.meta.url,
+);
 const bashPath = process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash";
 
 function toBashPath(path) {
@@ -70,7 +74,12 @@ async function createRepository(root, name, contents) {
 }
 
 async function runHelper(repository, script, env = {}) {
-  const sources = [integrityHelperUrl, expectedManifestHelperUrl, physicalTopologyHelperUrl]
+  const sources = [
+    integrityHelperUrl,
+    expectedManifestHelperUrl,
+    physicalTopologyHelperUrl,
+    physicalBlobHelperUrl,
+  ]
     .map((url) => `source "${toBashPath(fileURLToPath(url))}"`)
     .join("\n");
   const repositoryPath = toBashPath(repository);
@@ -118,6 +127,7 @@ async function createReleaseGitfileFixture(root) {
 
 async function createTopologyFixture(root) {
   const fixture = await createRepository(root, "canonical", "trusted\n");
+  await write(fixture.repository, ".gitattributes", "*.txt text eol=lf\n");
   await write(fixture.repository, ".gitignore", ".ignored\n");
   await write(fixture.repository, "nested/tracked.txt", "nested\n");
   if (process.platform !== "win32") {
@@ -140,6 +150,17 @@ if validate_release_physical_topology "$REPOSITORY" "$RELEASE" "${fixture.commit
     ? " && /usr/bin/cmp -s <(build_actual_release_topology_manifest \"$RELEASE\") <(build_actual_release_topology_manifest \"$RELEASE\")"
     : ""
 }; then
+  printf 'accepted\\n'
+else
+  printf 'rejected=%s\\n' "$release_worktree_integrity_error" >&2
+  exit 1
+fi`);
+}
+
+async function runBlobValidation(fixture) {
+  return runHelper(fixture.repository, `
+RELEASE="${toBashPath(fixture.release)}"
+if validate_release_physical_blobs "$REPOSITORY" "$RELEASE" "${fixture.commitSha}"; then
   printf 'accepted\\n'
 else
   printf 'rejected=%s\\n' "$release_worktree_integrity_error" >&2
@@ -694,4 +715,66 @@ test("physical topology accepts only the exact non-followed candidate tree", asy
       }
     });
   }
+});
+
+test("physical blob verification ignores Git state and compares raw bytes after topology", async (t) => {
+  async function check(name, mutate, expectedError = null) {
+    await t.test(name, async () => {
+      const root = await mkdtemp(join(tmpdir(), "al-lio-release-blobs-"));
+      try {
+        const fixture = await createTopologyFixture(root);
+        await mutate(fixture);
+        const result = await runBlobValidation(fixture);
+        if (expectedError) {
+          assert.notEqual(result.status, 0, `${name} unexpectedly passed`);
+          assert.match(result.stderr, expectedError);
+        } else {
+          assert.equal(result.status, 0, result.stderr);
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  await check("exact tracked bytes", async () => {});
+  await check("one-byte mutation", (f) => writeFile(join(f.release, "marker.txt"), "trusted!\n"), /do not match/);
+  await check("assume-unchanged cannot hide mutation", async (f) => {
+    git(f.release, ["update-index", "--assume-unchanged", "marker.txt"]);
+    await writeFile(join(f.release, "marker.txt"), "mutated\n");
+  }, /do not match/);
+  await check("skip-worktree cannot hide mutation", async (f) => {
+    git(f.release, ["update-index", "--skip-worktree", "marker.txt"]);
+    await writeFile(join(f.release, "marker.txt"), "mutated\n");
+  }, /do not match/);
+  await check("a manipulated index cannot authorize different bytes", async (f) => {
+    await writeFile(join(f.release, "marker.txt"), "mutated\n");
+    const changedOid = git(f.repository, ["hash-object", "-w", "--no-filters", join(f.release, "marker.txt")]);
+    git(f.release, ["update-index", "--cacheinfo", `100644,${changedOid},marker.txt`]);
+  }, /do not match/);
+  if (process.platform !== "win32") {
+    await check("physical CRLF differs from the canonical LF blob", async (f) => {
+      await writeFile(join(f.release, "marker.txt"), "trusted\r\n");
+    }, /do not match/);
+    await check("optional private env is excluded", async (f) => {
+      await writeFile(join(f.release, ".env"), "PRIVATE=changed\n");
+      await chmod(join(f.release, ".env"), 0o600);
+    });
+    await check("a forbidden parent symlink is rejected before byte hashing", async (f) => {
+      const outside = join(dirname(f.release), "outside-blobs");
+      await rename(join(f.release, "nested"), outside);
+      await symlink(outside, join(f.release, "nested"), "dir");
+    }, /unsupported physical type/);
+  }
+
+  const source = await readFile(physicalBlobHelperUrl, "utf8");
+  const topologyGate =
+    'validate_release_physical_topology "$repository_dir" "$release_dir" "$expected_sha" || return 1';
+  const rawByteHash =
+    'trusted_git "$repository_dir" hash-object --no-filters --stdin < "$release_dir/$path"';
+  assert.ok(source.indexOf(topologyGate) < source.indexOf(rawByteHash));
+  assert.match(source, /hash-object --no-filters --stdin/);
+  // The frozen filter sentinel remains absent because no path is supplied and filters are disabled.
+  assert.doesNotMatch(source, /--path|git -C/);
+  assert.match(source, /TOCTOU residual/);
 });
