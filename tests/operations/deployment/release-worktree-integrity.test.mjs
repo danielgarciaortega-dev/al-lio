@@ -1,0 +1,881 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import {
+  chmod,
+  link,
+  mkdtemp,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const integrityHelperUrl = new URL(
+  "../../../scripts/lib/release-worktree-integrity.sh",
+  import.meta.url,
+);
+const expectedManifestHelperUrl = new URL(
+  "../../../scripts/lib/release-expected-manifest.sh",
+  import.meta.url,
+);
+const physicalTopologyHelperUrl = new URL(
+  "../../../scripts/lib/release-physical-topology.sh",
+  import.meta.url,
+);
+const physicalBlobHelperUrl = new URL(
+  "../../../scripts/lib/release-physical-blobs.sh",
+  import.meta.url,
+);
+const bashPath = process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash";
+
+function toBashPath(path) {
+  return path.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`).replaceAll("\\", "/");
+}
+
+function git(directory, args, env = {}) {
+  const result = spawnSync("git", args, {
+    cwd: directory,
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+async function write(root, path, contents) {
+  const target = join(root, ...path.split("/"));
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, contents, "utf8");
+}
+
+async function commitAll(repository, message) {
+  git(repository, ["add", "--all"]);
+  git(repository, ["commit", "--quiet", "-m", message]);
+  return git(repository, ["rev-parse", "HEAD"]);
+}
+
+async function createRepository(root, name, contents) {
+  const repository = join(root, name);
+  await mkdir(repository);
+  git(repository, ["init", "--quiet"]);
+  git(repository, ["config", "user.email", "tests@al-lio.invalid"]);
+  git(repository, ["config", "user.name", "AL-LIO tests"]);
+  git(repository, ["config", "core.autocrlf", "false"]);
+  await write(repository, "marker.txt", contents);
+  const commitSha = await commitAll(repository, `${name} commit`);
+  return { repository, commitSha };
+}
+
+async function runHelper(repository, script, env = {}) {
+  const sources = [
+    integrityHelperUrl,
+    expectedManifestHelperUrl,
+    physicalTopologyHelperUrl,
+    physicalBlobHelperUrl,
+  ]
+    .map((url) => `source "${toBashPath(fileURLToPath(url))}"`)
+    .join("\n");
+  const repositoryPath = toBashPath(repository);
+  return spawnSync(bashPath, ["-s"], {
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+    input: `set -Eeuo pipefail
+${sources}
+REPOSITORY="${repositoryPath}"
+${script}
+`,
+  });
+}
+
+function validationScript(sha) {
+  return `if validate_release_commit_identity "$REPOSITORY" "${sha}"; then
+  printf 'accepted\\n'
+else
+  printf 'rejected=%s\\n' "$release_worktree_integrity_error" >&2
+  exit 1
+fi`;
+}
+
+async function createReleaseGitfileFixture(root) {
+  const canonical = await createRepository(root, "canonical", "trusted\n");
+  const release = join(root, "release");
+  git(canonical.repository, [
+    "worktree",
+    "add",
+    "--quiet",
+    "--detach",
+    release,
+    canonical.commitSha,
+  ]);
+  const gitfile = join(release, ".git");
+  const gitfileContents = await readFile(gitfile, "utf8");
+  const rawGitdir = gitfileContents.slice("gitdir: ".length, -1);
+  return {
+    ...canonical,
+    release,
+    gitfile,
+    linkedGitdir: rawGitdir.replaceAll("/", process.platform === "win32" ? "\\" : "/"),
+  };
+}
+
+async function createTopologyFixture(root) {
+  const fixture = await createRepository(root, "canonical", "trusted\n");
+  await write(fixture.repository, ".gitattributes", "*.txt text eol=lf\n");
+  await write(fixture.repository, ".gitignore", ".ignored\n");
+  await write(fixture.repository, "nested/tracked.txt", "nested\n");
+  await write(fixture.repository, "two words.txt", "spaces\n");
+  await write(fixture.repository, "$HOME;$(echo nope) [file].txt", "metacharacters\n");
+  if (process.platform !== "win32") {
+    await write(fixture.repository, "tab\tname.txt", "tab\n");
+    await write(fixture.repository, "line\nname.txt", "line\n");
+    await write(fixture.repository, "run.sh", "#!/bin/sh\nexit 0\n");
+    await chmod(join(fixture.repository, "run.sh"), 0o755);
+  }
+  fixture.commitSha = await commitAll(fixture.repository, "topology fixture");
+  fixture.release = join(root, "release");
+  if (process.platform === "win32") {
+    git(fixture.repository, ["worktree", "add", "--quiet", "--detach", fixture.release, fixture.commitSha]);
+  } else {
+    const worktreeCommand = [
+      "umask 022; git -C",
+      quoteBashPath(fixture.repository),
+      "worktree add --quiet --detach",
+      quoteBashPath(fixture.release),
+      fixture.commitSha,
+    ].join(" ");
+    const result = spawnSync(
+      bashPath,
+      ["-lc", worktreeCommand],
+      { encoding: "utf8" },
+    );
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+  }
+  return fixture;
+}
+
+async function runTopologyValidation(fixture, deterministic = false) {
+  return runHelper(fixture.repository, `
+RELEASE="${toBashPath(fixture.release)}"
+if validate_release_physical_topology "$REPOSITORY" "$RELEASE" "${fixture.commitSha}"${
+  deterministic
+    ? " && /usr/bin/cmp -s <(build_actual_release_topology_manifest \"$RELEASE\") <(build_actual_release_topology_manifest \"$RELEASE\")"
+    : ""
+}; then
+  printf 'accepted\\n'
+else
+  printf 'rejected=%s\\n' "$release_worktree_integrity_error" >&2
+  exit 1
+fi`);
+}
+
+async function runBlobValidation(fixture) {
+  return runHelper(fixture.repository, `
+RELEASE="${toBashPath(fixture.release)}"
+if validate_release_physical_blobs "$REPOSITORY" "$RELEASE" "${fixture.commitSha}"; then
+  printf 'accepted\\n'
+else
+  printf 'rejected=%s\\n' "$release_worktree_integrity_error" >&2
+  exit 1
+fi`);
+}
+
+async function runGitfileValidation(fixture, setup = "", successChecks = "") {
+  return runHelper(
+    fixture.repository,
+    `${setup}
+RELEASE="${toBashPath(fixture.release)}"
+if validate_release_gitfile_linkage "$REPOSITORY" "$RELEASE"; then
+  ${successChecks}
+  builtin printf 'accepted\\n'
+else
+  builtin printf 'rejected=%s\\n' "$release_worktree_integrity_error" >&2
+  exit 1
+fi`,
+  );
+}
+
+async function expectGitfileRejection(fixture, expectedError, setup = "") {
+  const result = await runGitfileValidation(fixture, setup);
+  assert.notEqual(result.status, 0, "hostile gitfile linkage unexpectedly passed");
+  assert.match(result.stderr, expectedError);
+}
+
+async function writeGitfileTarget(fixture, target) {
+  await rm(fixture.gitfile);
+  await writeFile(fixture.gitfile, `gitdir: ${target}\n`, "utf8");
+}
+
+async function replaceGitfile(fixture, contents) {
+  await rm(fixture.gitfile);
+  await writeFile(fixture.gitfile, contents);
+}
+
+async function createFileSymlink(target, path) {
+  try {
+    await symlink(target, path, "file");
+  } catch (error) {
+    if (process.platform !== "win32" || error.code !== "EPERM") throw error;
+    const result = spawnSync(
+      bashPath,
+      ["-lc", `ln -s -- ${quoteBashPath(target)} ${quoteBashPath(path)}`],
+      {
+        encoding: "utf8",
+        env: { ...process.env, MSYS: "winsymlinks:sys" },
+      },
+    );
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+  }
+}
+
+function quoteBashPath(value) {
+  return `'${toBashPath(value).replaceAll("'", "'\\''")}'`;
+}
+
+test("canonical commit identity accepts only an exact lowercase commit SHA", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-trusted-git-identity-"));
+  try {
+    const fixture = await createRepository(root, "canonical", "trusted\n");
+    const blobSha = git(fixture.repository, ["rev-parse", `${fixture.commitSha}:marker.txt`]);
+    const treeSha = git(fixture.repository, ["rev-parse", `${fixture.commitSha}^{tree}`]);
+    git(fixture.repository, ["tag", "--annotate", "--message", "tag object", "release-tag"]);
+    const tagSha = git(fixture.repository, ["rev-parse", "release-tag^{tag}"]);
+
+    await t.test("valid lowercase 40-character commit", async () => {
+      const accepted = await runHelper(
+        fixture.repository,
+        validationScript(fixture.commitSha),
+      );
+      assert.equal(accepted.status, 0, accepted.stderr);
+      assert.equal(accepted.stdout, "accepted\n");
+    });
+
+    for (const [name, sha, expectedError] of [
+      ["abbreviated", fixture.commitSha.slice(0, 12), /exactly 40 lowercase/],
+      ["uppercase", fixture.commitSha.toUpperCase(), /exactly 40 lowercase/],
+      ["malformed", "not-a-sha", /exactly 40 lowercase/],
+      ["nonexistent", "0".repeat(40), /does not resolve in the canonical repository/],
+      ["blob", blobSha, /Release object is not a commit/],
+      ["tree", treeSha, /Release object is not a commit/],
+      ["annotated tag", tagSha, /Release object is not a commit/],
+    ]) {
+      await t.test(`${name} object identity`, async () => {
+        const rejected = await runHelper(fixture.repository, validationScript(sha));
+        assert.notEqual(rejected.status, 0, `${name} unexpectedly passed`);
+        assert.match(rejected.stderr, expectedError, name);
+      });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("hostile caller Git repository and index environment cannot redirect lookup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-trusted-git-environment-"));
+  try {
+    const canonical = await createRepository(root, "canonical", "trusted\n");
+    const hostile = await createRepository(root, "hostile", "hostile\n");
+    const result = await runHelper(
+      canonical.repository,
+      validationScript(canonical.commitSha),
+      {
+        GIT_DIR: toBashPath(join(hostile.repository, ".git")),
+        GIT_WORK_TREE: toBashPath(hostile.repository),
+        GIT_COMMON_DIR: toBashPath(join(hostile.repository, ".git")),
+        GIT_INDEX_FILE: toBashPath(join(hostile.repository, ".git", "index")),
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "accepted\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("canonical commit identity rejects non-canonical repository paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-trusted-git-path-"));
+  try {
+    const canonical = await createRepository(root, "canonical", "trusted\n");
+    const relative = await runHelper(
+      canonical.repository,
+      `if validate_release_commit_identity "." "${canonical.commitSha}"; then exit 41; fi
+printf 'relative=%s\\n' "$release_worktree_integrity_error"`,
+    );
+    assert.equal(relative.status, 0, relative.stderr);
+    assert.match(relative.stdout, /Canonical repository Git directory is unavailable/);
+
+    const alias = join(root, "canonical-alias");
+    await symlink(
+      canonical.repository,
+      alias,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const linked = await runHelper(alias, validationScript(canonical.commitSha));
+    assert.notEqual(linked.status, 0);
+    assert.match(linked.stderr, /Canonical repository Git directory is unavailable/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("hostile object, alternate-object and namespace environment cannot redirect lookup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-trusted-git-objects-"));
+  try {
+    const canonical = await createRepository(root, "canonical", "trusted\n");
+    const hostile = await createRepository(root, "hostile", "hostile\n");
+    const result = await runHelper(
+      canonical.repository,
+      validationScript(canonical.commitSha),
+      {
+        GIT_OBJECT_DIRECTORY: toBashPath(join(hostile.repository, ".git", "objects")),
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: toBashPath(join(hostile.repository, ".git", "objects")),
+        GIT_NAMESPACE: "hostile-namespace",
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "accepted\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("hostile system and global Git config cannot influence trusted lookup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-trusted-git-config-"));
+  try {
+    const canonical = await createRepository(root, "canonical", "trusted\n");
+    const hostile = await createRepository(root, "hostile", "hostile\n");
+    const systemConfig = join(root, "system.gitconfig");
+    const globalConfig = join(root, "global.gitconfig");
+    await writeFile(
+      systemConfig,
+      `[al-lio]\n\tsystem-sentinel = hostile\n[core]\n\tworktree = ${toBashPath(hostile.repository)}\n`,
+      "utf8",
+    );
+    await writeFile(
+      globalConfig,
+      `[al-lio]\n\tglobal-sentinel = hostile\n[core]\n\tworktree = ${toBashPath(hostile.repository)}\n`,
+      "utf8",
+    );
+
+    const result = await runHelper(
+      canonical.repository,
+      `if trusted_git "$REPOSITORY" config --get al-lio.system-sentinel; then exit 41; fi
+if trusted_git "$REPOSITORY" config --get al-lio.global-sentinel; then exit 42; fi
+${validationScript(canonical.commitSha)}`,
+      {
+        GIT_CONFIG_SYSTEM: toBashPath(systemConfig),
+        GIT_CONFIG_GLOBAL: toBashPath(globalConfig),
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "accepted\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trusted lookup ignores a malicious git replace visible to unhardened Git", async () => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-trusted-git-replace-"));
+  try {
+    const fixture = await createRepository(root, "canonical", "trusted\n");
+    await write(fixture.repository, "marker.txt", "hostile\n");
+    const hostileSha = await commitAll(fixture.repository, "hostile replacement");
+    git(fixture.repository, ["replace", fixture.commitSha, hostileSha]);
+
+    assert.equal(
+      git(fixture.repository, ["show", `${fixture.commitSha}:marker.txt`]),
+      "hostile",
+    );
+
+    const result = await runHelper(
+      fixture.repository,
+      `printf 'trusted-content=%s\\n' "$(trusted_git "$REPOSITORY" show "${fixture.commitSha}:marker.txt")"
+${validationScript(fixture.commitSha)}`,
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "trusted-content=trusted\naccepted\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trusted lookup ignores a hostile GIT_REPLACE_REF_BASE", async () => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-trusted-git-replace-base-"));
+  try {
+    const fixture = await createRepository(root, "canonical", "trusted\n");
+    await write(fixture.repository, "marker.txt", "hostile\n");
+    const hostileSha = await commitAll(fixture.repository, "hostile replacement base");
+    const replacementBase = "refs/hostile-replacements/";
+    git(fixture.repository, [
+      "update-ref",
+      `${replacementBase}${fixture.commitSha}`,
+      hostileSha,
+    ]);
+
+    assert.equal(
+      git(
+        fixture.repository,
+        ["show", `${fixture.commitSha}:marker.txt`],
+        { GIT_REPLACE_REF_BASE: replacementBase },
+      ),
+      "hostile",
+    );
+
+    const result = await runHelper(
+      fixture.repository,
+      `printf 'trusted-content=%s\\n' "$(trusted_git "$REPOSITORY" show "${fixture.commitSha}:marker.txt")"
+${validationScript(fixture.commitSha)}`,
+      { GIT_REPLACE_REF_BASE: replacementBase },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "trusted-content=trusted\naccepted\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("final validation does not execute Git hooks, fsmonitor, filters, diff, or textconv", async () => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-trusted-git-sentinels-"));
+  try {
+    const fixture = await createTopologyFixture(root);
+    const control = join(root, "sentinel-control");
+    const script = join(control, "record-sentinel.sh");
+    await mkdir(control);
+    await writeFile(script, "#!/bin/sh\n: > \"$1\"\ncat\n", "utf8");
+
+    const sentinels = Object.fromEntries(
+      ["hook", "fsmonitor", "clean", "smudge", "diff", "textconv"].map((name) => [
+        name,
+        join(control, `${name}.executed`),
+      ]),
+    );
+    const command = (name) => `sh ${quoteBashPath(script)} ${quoteBashPath(sentinels[name])}`;
+
+    await writeFile(
+      join(fixture.repository, ".git", "info", "attributes"),
+      "*.txt filter=release-sentinel diff=release-sentinel\n",
+      "utf8",
+    );
+    git(fixture.repository, ["config", "core.fsmonitor", command("fsmonitor")]);
+    git(fixture.repository, ["config", "filter.release-sentinel.clean", command("clean")]);
+    git(fixture.repository, ["config", "filter.release-sentinel.smudge", command("smudge")]);
+    git(fixture.repository, ["config", "diff.release-sentinel.command", command("diff")]);
+    git(fixture.repository, ["config", "diff.release-sentinel.textconv", command("textconv")]);
+    await writeFile(
+      join(fixture.repository, ".git", "hooks", "post-checkout"),
+      `#!/bin/sh\n: > ${quoteBashPath(sentinels.hook)}\n`,
+      "utf8",
+    );
+    await chmod(join(fixture.repository, ".git", "hooks", "post-checkout"), 0o755);
+
+    git(fixture.repository, ["hash-object", "--path=marker.txt", "marker.txt"]);
+    assert.equal(await readFile(sentinels.clean, "utf8"), "");
+    await rm(sentinels.clean);
+
+    const result = await runBlobValidation(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    for (const [name, path] of Object.entries(sentinels)) {
+      await assert.rejects(readFile(path), (error) => error.code === "ENOENT", name);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("release gitfile linkage accepts a valid detached worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-valid-"));
+  try {
+    const fixture = await createReleaseGitfileFixture(root);
+    const result = await runGitfileValidation(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "accepted\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("release .git must be a single regular file with strict metadata", async (t) => {
+  for (const [name, mutate, expectedError] of [
+    [
+      "directory",
+      async (fixture) => {
+        await rm(fixture.gitfile);
+        await mkdir(fixture.gitfile);
+      },
+      /regular non-symlink file/,
+    ],
+    [
+      "symlink",
+      async (fixture) => {
+        const target = join(dirname(fixture.release), "linked-gitfile");
+        await writeFile(target, await readFile(fixture.gitfile));
+        await rm(fixture.gitfile);
+        await createFileSymlink(target, fixture.gitfile);
+      },
+      /regular non-symlink file/,
+    ],
+    [
+      "hard link",
+      async (fixture) => {
+        await link(fixture.gitfile, join(dirname(fixture.release), "gitfile-hardlink"));
+      },
+      /one hard link/,
+    ],
+  ]) {
+    await t.test(name, async () => {
+      const root = await mkdtemp(join(tmpdir(), `al-lio-release-gitfile-${name}-`));
+      try {
+        const fixture = await createReleaseGitfileFixture(root);
+        await mutate(fixture);
+        await expectGitfileRejection(fixture, expectedError);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  await t.test("mode changed on the physical file", async (modeTest) => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-mode-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      await chmod(fixture.gitfile, 0o600);
+      const mode = spawnSync(
+        bashPath,
+        ["-lc", `/usr/bin/stat -c '%a' -- ${quoteBashPath(fixture.gitfile)}`],
+        { encoding: "utf8" },
+      );
+      assert.ifError(mode.error);
+      assert.equal(mode.status, 0, mode.stderr);
+      if (mode.stdout.trim() === "644") {
+        modeTest.skip("Git Bash on this Windows filesystem does not expose chmod mode changes");
+        return;
+      }
+      await expectGitfileRejection(fixture, /mode 0644/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("release .git rejects malformed raw bytes before parsing", async (t) => {
+  const malformedCases = [
+    ["empty file", Buffer.alloc(0), /between 1 and 4096 bytes/],
+    ["empty target", Buffer.from("gitdir: \n"), /empty gitdir target/],
+    ["multiple lines", Buffer.from("gitdir: /tmp/one\n/tmp/two\n"), /exactly one control-free line/],
+    ["missing final LF", Buffer.from("gitdir: /tmp/one"), /exactly one control-free line/],
+    ["carriage return", Buffer.from("gitdir: /tmp/one\r\n"), /exactly one control-free line/],
+    ["NUL", Buffer.from("gitdir: /tmp/\0one\n"), /exactly one control-free line/],
+    ["C0 control", Buffer.from("gitdir: /tmp/\u0001one\n"), /exactly one control-free line/],
+    ["DEL control", Buffer.from("gitdir: /tmp/\u007fone\n"), /exactly one control-free line/],
+    ["wrong prefix", Buffer.from("git-dir: /tmp/one\n"), /literal prefix/],
+    ["relative target", Buffer.from("gitdir: ../canonical/.git/worktrees/release\n"), /must be absolute/],
+    ["oversized", Buffer.from(`gitdir: /${"a".repeat(4096)}\n`), /between 1 and 4096 bytes/],
+  ];
+
+  for (const [name, contents, expectedError] of malformedCases) {
+    await t.test(name, async () => {
+      const root = await mkdtemp(join(tmpdir(), `al-lio-release-gitfile-raw-${name}-`));
+      try {
+        const fixture = await createReleaseGitfileFixture(root);
+        await replaceGitfile(fixture, contents);
+        await expectGitfileRejection(fixture, expectedError);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("release gitdir target must be the exact canonical immediate worktree child", async (t) => {
+  await t.test("outside canonical worktrees", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-outside-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      const outside = join(root, "outside-gitdir");
+      await mkdir(outside);
+      await writeGitfileTarget(fixture, toBashPath(outside));
+      await expectGitfileRejection(fixture, /outside the canonical worktrees directory/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("nested descendant", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-nested-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      const nested = join(fixture.linkedGitdir, "nested");
+      await mkdir(nested);
+      await writeGitfileTarget(fixture, toBashPath(nested));
+      await expectGitfileRejection(fixture, /one immediate child/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("symlinked intermediate component", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-symlink-component-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      const worktrees = join(fixture.repository, ".git", "worktrees");
+      const realWorktrees = join(fixture.repository, ".git", "worktrees-real");
+      await rename(worktrees, realWorktrees);
+      await symlink(realWorktrees, worktrees, process.platform === "win32" ? "junction" : "dir");
+      await expectGitfileRejection(fixture, /traverses a symlink/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("release gitdir metadata must link only the canonical repository and release", async (t) => {
+  await t.test("bad commondir", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-commondir-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      await writeFile(join(fixture.linkedGitdir, "commondir"), "../../../outside\n", "utf8");
+      await expectGitfileRejection(fixture, /commondir/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("bad gitdir backpointer", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-backpointer-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      const wrongGitfile = join(root, "wrong-gitfile");
+      await writeFile(wrongGitfile, "wrong\n", "utf8");
+      await writeFile(
+        join(fixture.linkedGitdir, "gitdir"),
+        `${toBashPath(wrongGitfile)}\n`,
+        "utf8",
+      );
+      await expectGitfileRejection(fixture, /backpointer does not identify/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("metadata belonging to another release", async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-other-release-"));
+    try {
+      const fixture = await createReleaseGitfileFixture(root);
+      const otherRelease = join(root, "other-release");
+      git(fixture.repository, [
+        "worktree",
+        "add",
+        "--quiet",
+        "--detach",
+        otherRelease,
+        fixture.commitSha,
+      ]);
+      const otherGitfile = await readFile(join(otherRelease, ".git"), "utf8");
+      await replaceGitfile(fixture, otherGitfile);
+      await expectGitfileRejection(fixture, /backpointer does not identify/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// Source-level assertion rationale: executing the real boundary proves allowed behavior, but cannot prove a forbidden `git -C` call is absent from every trusted-boundary path; this narrow source assertion enforces that negative invariant.
+test("the trusted commit boundary never executes Git against release-local state", async () => {
+  const source = await readFile(integrityHelperUrl, "utf8");
+  const boundaryStart = source.indexOf("trusted_git() {");
+  const legacyStart = source.indexOf("validate_release_worktree_integrity() {");
+  const boundary = source.slice(boundaryStart, legacyStart);
+
+  assert.ok(boundaryStart >= 0 && legacyStart > boundaryStart);
+  assert.doesNotMatch(boundary, /git -C/);
+  assert.match(boundary, /--git-dir="\$repository_dir\/\.git"/);
+  assert.match(boundary, /\/usr\/bin\/env -i/);
+  assert.match(boundary, /GIT_CONFIG_NOSYSTEM=1/);
+  assert.match(boundary, /GIT_CONFIG_GLOBAL=\/dev\/null/);
+  assert.match(boundary, /GIT_NO_REPLACE_OBJECTS=1/);
+  assert.match(boundary, /--no-replace-objects/);
+  assert.match(boundary, /LC_ALL=C/);
+  assert.match(boundary, /GIT_TERMINAL_PROMPT=0/);
+});
+
+test("physical topology accepts only the exact non-followed candidate tree", async (t) => {
+  const cases = [
+    ["extra file", (f) => writeFile(join(f.release, "extra.txt"), "extra"), /does not exactly match/],
+    ["ignored file", (f) => writeFile(join(f.release, ".ignored"), "ignored"), /does not exactly match/],
+    ["extra empty directory", (f) => mkdir(join(f.release, "empty")), /does not exactly match/],
+    ["missing tracked file", (f) => rm(join(f.release, "marker.txt")), /does not exactly match/],
+    ["file replaced by directory", async (f) => {
+      await rm(join(f.release, "marker.txt"));
+      await mkdir(join(f.release, "marker.txt"));
+    }, /does not exactly match/],
+    ["hardlinked tracked file", (f) => link(join(f.release, "marker.txt"), join(f.release, "hardlink")), /one hard link/],
+    ["tracked symlink", async (f) => {
+      await rm(join(f.release, "marker.txt"));
+      await createFileSymlink(join(f.release, "nested", "tracked.txt"), join(f.release, "marker.txt"));
+    }, /unsupported physical type/],
+    ["parent symlink", async (f) => {
+      const outside = join(dirname(f.release), "outside");
+      await rename(join(f.release, "nested"), outside);
+      await symlink(outside, join(f.release, "nested"), process.platform === "win32" ? "junction" : "dir");
+    }, /unsupported physical type/],
+    ["env directory", (f) => mkdir(join(f.release, ".env")), /Release \.env/],
+    ["env symlink", async (f) => {
+      const outside = join(dirname(f.release), "outside-env");
+      await writeFile(outside, "SAFE=fixture\n");
+      await createFileSymlink(outside, join(f.release, ".env"));
+    }, /Release \.env/],
+    ["env hardlink", async (f) => {
+      await writeFile(join(f.release, ".env"), "SAFE=fixture\n");
+      await chmod(join(f.release, ".env"), 0o600);
+      await link(join(f.release, ".env"), join(dirname(f.release), "env-link"));
+    }, /Release \.env/],
+  ];
+  if (process.platform !== "win32") {
+    cases.push(
+      ["FIFO", (f) => spawnSync(bashPath, ["-lc", `/usr/bin/mkfifo -- ${quoteBashPath(join(f.release, "pipe"))}`]), /unsupported physical type/],
+      ["socket", (f) => spawnSync(process.execPath, ["-e", "require('node:net').createServer().listen(process.argv[1],()=>process.exit(0))", join(f.release, "socket")]), /unsupported physical type/],
+      ["wrong root mode", (f) => chmod(f.release, 0o700), /Release root/],
+      ["root special bits", (f) => chmod(f.release, 0o1755), /Release root/],
+      ["wrong directory mode", (f) => chmod(join(f.release, "nested"), 0o700), /Release directory/],
+      ["directory special bits", (f) => chmod(join(f.release, "nested"), 0o2755), /Release directory/],
+      ["wrong file mode", (f) => chmod(join(f.release, "marker.txt"), 0o600), /unsupported mode/],
+      ["file special bits", (f) => chmod(join(f.release, "marker.txt"), 0o4644), /unsupported mode/],
+      ["wrong env mode", (f) => writeFile(join(f.release, ".env"), "SAFE=fixture\n"), /Release \.env/],
+      [
+        "env special bits",
+        async (f) => {
+          await writeFile(join(f.release, ".env"), "SAFE=fixture\n");
+          await chmod(join(f.release, ".env"), 0o1600);
+        },
+        /Release \.env/,
+      ],
+      ["valid private env", async (f) => {
+        await writeFile(join(f.release, ".env"), "SAFE=fixture\n");
+        await chmod(join(f.release, ".env"), 0o600);
+      }, null],
+    );
+  }
+
+  const validTreeCase = process.platform === "win32"
+    ? "valid detached tree and deterministic manifest"
+    : "valid detached tree under controlled umask 022 and deterministic manifest";
+  await t.test(validTreeCase, async () => {
+    const root = await mkdtemp(join(tmpdir(), "al-lio-release-topology-valid-"));
+    try {
+      const result = await runTopologyValidation(await createTopologyFixture(root), true);
+      assert.equal(result.status, 0, result.stderr);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  for (const [name, mutate, expectedError] of cases) {
+    await t.test(name, async () => {
+      const root = await mkdtemp(join(tmpdir(), "al-lio-release-topology-case-"));
+      try {
+        const fixture = await createTopologyFixture(root);
+        const mutation = await mutate(fixture);
+        if (mutation?.error) throw mutation.error;
+        const result = await runTopologyValidation(fixture);
+        if (expectedError) {
+          assert.notEqual(result.status, 0, `${name} unexpectedly passed`);
+          assert.match(result.stderr, expectedError);
+        } else {
+          assert.equal(result.status, 0, result.stderr);
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("physical blob verification ignores Git state and compares raw bytes after topology", async (t) => {
+  async function check(name, mutate, expectedError = null) {
+    await t.test(name, async () => {
+      const root = await mkdtemp(join(tmpdir(), "al-lio-release-blobs-"));
+      try {
+        const fixture = await createTopologyFixture(root);
+        await mutate(fixture);
+        const result = await runBlobValidation(fixture);
+        if (expectedError) {
+          assert.notEqual(result.status, 0, `${name} unexpectedly passed`);
+          assert.match(result.stderr, expectedError);
+        } else {
+          assert.equal(result.status, 0, result.stderr);
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  await check("exact tracked bytes", async () => {});
+  await check("one-byte mutation", (f) => writeFile(join(f.release, "marker.txt"), "trusted!\n"), /do not match/);
+  await check("assume-unchanged cannot hide mutation", async (f) => {
+    git(f.release, ["update-index", "--assume-unchanged", "marker.txt"]);
+    await writeFile(join(f.release, "marker.txt"), "mutated\n");
+    assert.equal(git(f.release, ["status", "--porcelain", "--", "marker.txt"]), "");
+  }, /do not match/);
+  await check("skip-worktree cannot hide mutation", async (f) => {
+    git(f.release, ["update-index", "--skip-worktree", "marker.txt"]);
+    await writeFile(join(f.release, "marker.txt"), "mutated\n");
+    assert.equal(git(f.release, ["status", "--porcelain", "--", "marker.txt"]), "");
+  }, /do not match/);
+  await check("a manipulated index cannot authorize different bytes", async (f) => {
+    await writeFile(join(f.release, "marker.txt"), "mutated\n");
+    const changedOid = git(f.repository, ["hash-object", "-w", "--no-filters", join(f.release, "marker.txt")]);
+    git(f.release, ["update-index", "--cacheinfo", `100644,${changedOid},marker.txt`]);
+    git(f.release, ["diff", "--quiet", "--", "marker.txt"]);
+    assert.match(git(f.release, ["ls-files", "--stage", "--", "marker.txt"]), new RegExp(changedOid));
+  }, /do not match/);
+  await check("ordinary core.worktree cannot redirect the physical target", async (f) => {
+    const alternate = join(dirname(f.release), "alternate-core-worktree");
+    git(f.repository, ["worktree", "add", "--quiet", "--detach", alternate, f.commitSha]);
+    git(f.release, ["config", "core.worktree", alternate]);
+    await writeFile(join(f.release, "marker.txt"), "mutated\n");
+    assert.equal(git(f.release, ["status", "--porcelain", "--", "marker.txt"]), "M marker.txt");
+    assert.equal(git(f.release, ["rev-parse", "--show-toplevel"]), f.release.replaceAll("\\", "/"));
+  }, /do not match/);
+  await check("worktree-local config cannot redirect the physical target", async (f) => {
+    const alternate = join(dirname(f.release), "alternate-private-worktree");
+    git(f.repository, ["worktree", "add", "--quiet", "--detach", alternate, f.commitSha]);
+    git(f.repository, ["config", "extensions.worktreeConfig", "true"]);
+    git(f.release, ["config", "--worktree", "core.worktree", alternate]);
+    await writeFile(join(f.release, "marker.txt"), "mutated\n");
+    assert.equal(git(f.release, ["status", "--porcelain", "--", "marker.txt"]), "");
+    assert.equal(git(f.release, ["rev-parse", "--show-toplevel"]), alternate.replaceAll("\\", "/"));
+  }, /do not match/);
+  if (process.platform !== "win32") {
+    await check("physical CRLF differs from the canonical LF blob", async (f) => {
+      await writeFile(join(f.release, "marker.txt"), "trusted\r\n");
+    }, /do not match/);
+    await check("optional private env is excluded", async (f) => {
+      await writeFile(join(f.release, ".env"), "PRIVATE=changed\n");
+      await chmod(join(f.release, ".env"), 0o600);
+    });
+    await check("a forbidden parent symlink is rejected before byte hashing", async (f) => {
+      const outside = join(dirname(f.release), "outside-blobs");
+      await rename(join(f.release, "nested"), outside);
+      await symlink(outside, join(f.release, "nested"), "dir");
+    }, /unsupported physical type/);
+  }
+
+  const source = await readFile(physicalBlobHelperUrl, "utf8");
+  const topologyGate =
+    'validate_release_physical_topology "$repository_dir" "$release_dir" "$expected_sha" || return 1';
+  const rawByteHash =
+    'trusted_git "$repository_dir" hash-object --no-filters --stdin < "$release_dir/$path"';
+  assert.ok(source.indexOf(topologyGate) < source.indexOf(rawByteHash));
+  assert.match(source, /hash-object --no-filters --stdin/);
+  // The frozen filter sentinel remains absent because no path is supplied and filters are disabled.
+  assert.doesNotMatch(source, /--path|git -C/);
+  assert.match(source, /TOCTOU residual/);
+});

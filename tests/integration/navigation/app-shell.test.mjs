@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { readFeatureSource, readProductFeatureSources } from "../../helpers/feature-sources.mjs";
+import { readFeatureSource, readProductFeatureSources } from "../../support/feature-sources.mjs";
 
 test("The authenticated student tree owns exactly one store provider (issue #90)", async () => {
   const [guestAppSource, guestStoreSource, storedGuestAppSource, dashboardClientSource, layoutSource] = await Promise.all([

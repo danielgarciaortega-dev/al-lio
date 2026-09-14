@@ -131,7 +131,7 @@ test("issue #357: no unregistered 410 Gone route can be added", () => {
 });
 
 test("issue #357/#379: every registered flag is still read by a listed consumer", () => {
-  assert.equal(flags.length, 4, `expected 4 application flags, parsed ${flags.length}`);
+  assert.equal(flags.length, 5, `expected 5 application flags, parsed ${flags.length}`);
   for (const flag of flags) {
     assert.ok(FLAG_CLASSES.has(flag.klass), `unknown flag class "${flag.klass}" for ${flag.name}`);
     assert.ok(flag.consumers.length > 0, `flag ${flag.name} lists no consumer`);

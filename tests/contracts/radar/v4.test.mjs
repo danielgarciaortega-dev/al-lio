@@ -1,3 +1,7 @@
+// Source-level assertion rationale: the JSON files are immutable versioned wire
+// fixtures, so parsing their committed bytes is the real contract boundary. The
+// production schemas and projection functions are imported and executed directly.
+
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { readFeatureSource } from "../../helpers/feature-sources.mjs";
+import { readFeatureSource } from "../../support/feature-sources.mjs";
 
 import { SPANISH_PROVINCES } from "../../../src/lib/deeplinks/spanish-provinces.ts";
 

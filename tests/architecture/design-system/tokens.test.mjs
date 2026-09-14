@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { readProductFeatureSources } from "../../helpers/feature-sources.mjs";
+import { readProductFeatureSources } from "../../support/feature-sources.mjs";
 
 test("globals.css's --primary and --ring are the brand terracotta, not the default shadcn blue (issue #82)", async () => {
   const css = await readFile(new URL("../../../src/app/globals.css", import.meta.url), "utf8");

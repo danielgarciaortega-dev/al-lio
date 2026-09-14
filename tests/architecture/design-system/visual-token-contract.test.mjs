@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { contrastRatio, readRootTokens, resolveColor } from "../../helpers/contrast.mjs";
+import { contrastRatio, readRootTokens, resolveColor } from "./support/contrast.mjs";
 
 const GLOBALS_CSS = new URL("../../../src/app/globals.css", import.meta.url);
 const UI = (name) => new URL(`../../../src/components/ui/${name}`, import.meta.url);

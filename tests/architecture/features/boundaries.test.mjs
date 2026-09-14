@@ -1,3 +1,8 @@
+// Source-level assertion rationale: route composition and authorization placement
+// are architecture boundaries across Next.js server modules that the plain Node
+// runner cannot import safely. The executable boundary checker is also invoked
+// directly for dependency and module-size enforcement.
+
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";

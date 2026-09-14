@@ -183,6 +183,7 @@ separately below.
 | `AL_LIO_RADAR_WEBHOOK_SECRET` | `src/lib/radar/webhook-auth.ts` | active |
 | `AL_LIO_RADAR_V4_PROJECT_DESTINATIONS` | `src/lib/radar/v4-projection.ts` | dormant |
 | `AL_LIO_RADAR_LEARNING_INGEST_ENABLED` | `src/app/api/radar/v1/learning/route.ts` | dormant |
+| `AL_LIO_RELEASE_SHA` | `src/app/api/version/route.ts` | active |
 | `AL_LIO_VERIFIED_OPPORTUNITIES_ONLY` | `src/lib/data.ts`, `src/features/learning/server/catalogue-repository.ts` | dormant |
 
 - **`AL_LIO_RADAR_WEBHOOK_SECRET`** — `active`. The HMAC secret every Radar
@@ -202,6 +203,10 @@ separately below.
   before any authentication or body read. Intended to be enabled only after the
   Radar #24 / AL-LIO #202 contract fixtures are reviewed together (see
   `.env.example`). `validate-runtime-env.mjs` validates it is `true`/`false`.
+- **`AL_LIO_RELEASE_SHA`** — `active`. The immutable release mechanism injects
+  the exact 40-character commit SHA into the private release `.env`.
+  `GET /api/version` exposes only that value, and production startup rejects a
+  missing or malformed identity. It is not a developer-managed feature flag.
 - **`AL_LIO_VERIFIED_OPPORTUNITIES_ONLY`** — `dormant` (product gate). Default
   off. When `true`, `src/lib/data.ts` drops `tech_opportunities` course rows
   and `src/features/learning/server/catalogue-repository.ts` restricts the
@@ -231,7 +236,8 @@ are out of scope for application compatibility classification.
   `AL_LIO_RADAR_BUILD_CONTEXT`, `AL_LIO_RADAR_IMAGE_TAG`. Their fail-closed
   defaults are asserted by `scripts/validate-radar-integration.mjs` and
   `tests/operations/deployment/radar-production-config.test.mjs`.
-- **Deployment / image selection**: `AL_LIO_IMAGE_TAG`.
+- **Deployment / image selection**: `AL_LIO_IMAGE_TAG` (the application-owned
+  `AL_LIO_RELEASE_SHA` is registered above).
 - **Migrator guardrails** (`al_lio_migrator` in `infra/docker-compose.prod.yml`):
   `AL_LIO_BASELINE_CONFIRMATION`, `AL_LIO_BASELINE_RECONCILIATION`,
   `AL_LIO_DB_ROLE_CONFIRMATION`.

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { readFeatureSource } from "../../helpers/feature-sources.mjs";
+import { readFeatureSource } from "../../support/feature-sources.mjs";
 
 test("No user-facing 'Archivados' label survives anywhere in the app - Cursos and Eventos y retos were the only two", async () => {
   const source = await readFeatureSource("courses", "events");

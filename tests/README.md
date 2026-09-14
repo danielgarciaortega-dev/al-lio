@@ -15,6 +15,7 @@ tests/
 ├── contracts/           # versioned payload and cross-system contracts
 ├── integration/         # route, server, persistence and UI wiring boundaries
 ├── operations/          # deployment, Compose, migrations, runtime and importers
+├── support/             # genuinely cross-domain test infrastructure
 ├── unit/                # directly executable pure functions and domain rules
 └── migration-inventory.json
 ```
@@ -29,6 +30,10 @@ implementation when the selected component runner supports co-location cleanly.
 Versioned cross-system fixtures stay beside their contract; reusable test factories
 belong to the domain that defines them. `tests/support/` is reserved for genuinely
 cross-domain test infrastructure and must not become another catch-all.
+
+The product-source reader lives in `tests/support/` because integration, architecture,
+and unit suites across several owner domains consume it. Design-system contrast helpers
+stay under `tests/architecture/design-system/support/`, beside their sole owner domain.
 
 ## Commands
 
