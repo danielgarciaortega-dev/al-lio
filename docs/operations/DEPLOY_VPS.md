@@ -1053,6 +1053,7 @@ umask 077
 export LC_ALL=C
 AL_LIO_RELEASES_DIR=/srv/danicode/releases
 AL_LIO_BACKUP_DIR=/srv/danicode/backups/al-lio
+AL_LIO_REPOSITORY_DIR=/srv/danicode/projects/al-lio
 export AL_LIO_SELECTED_RELEASE_RECORD="REPLACE_WITH_EXACT_PRIVATE_RELEASE_RECORD_PATH"
 
 command -v flock >/dev/null || {
@@ -1218,36 +1219,52 @@ read_env_value() {
   printf '%s' "$value"
 }
 
-validate_recovery_integrity_helper_blob() {
-  local metadata entry_path mode type object
-  IFS=$'\t' read -r metadata entry_path < <(
-    git -C "$AL_LIO_RELEASE_DIR" ls-tree "$AL_LIO_RELEASE_SHA" -- \
-      scripts/lib/release-worktree-integrity.sh
-  )
-  read -r mode type object <<< "$metadata"
-  [[ "$entry_path" == scripts/lib/release-worktree-integrity.sh &&
-    "$mode" == 100644 && "$type" == blob &&
-    "$object" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || {
-    printf 'ERROR: candidate release-worktree integrity helper is not an exact 100644 blob.\n' >&2
-    return 1
-  }
-  printf '%s' "$object"
+trusted_recovery_git() {
+  local repository_dir="$1" trusted_git_binary=""
+  shift
+  if [[ -x /usr/bin/git ]]; then
+    trusted_git_binary=/usr/bin/git
+  elif [[ -x /mingw64/bin/git.exe ]]; then
+    trusted_git_binary=/mingw64/bin/git.exe
+  else
+    return 127
+  fi
+  /usr/bin/env -i HOME=/nonexistent PATH=/usr/bin:/bin:/mingw64/bin LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null \
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false \
+    GIT_OPTIONAL_LOCKS=0 "$trusted_git_binary" --no-replace-objects \
+    --git-dir="$repository_dir/.git" "$@"
 }
 
-AL_LIO_RECOVERY_INTEGRITY_OBJECT="$(validate_recovery_integrity_helper_blob)" || exit 1
+[[ "$AL_LIO_REPOSITORY_DIR" == /* && -d "$AL_LIO_REPOSITORY_DIR" &&
+  ! -L "$AL_LIO_REPOSITORY_DIR" && -d "$AL_LIO_REPOSITORY_DIR/.git" &&
+  ! -L "$AL_LIO_REPOSITORY_DIR/.git" &&
+  "$(/usr/bin/readlink -f -- "$AL_LIO_REPOSITORY_DIR")" == "$AL_LIO_REPOSITORY_DIR" &&
+  "$(/usr/bin/readlink -f -- "$AL_LIO_REPOSITORY_DIR/.git")" == "$AL_LIO_REPOSITORY_DIR/.git" ]] || {
+  printf 'ERROR: canonical recovery repository is unavailable or non-canonical.\n' >&2
+  exit 1
+}
+[[ "$(trusted_recovery_git "$AL_LIO_REPOSITORY_DIR" rev-parse --verify \
+  "$AL_LIO_RELEASE_SHA^{object}")" == "$AL_LIO_RELEASE_SHA" &&
+  "$(trusted_recovery_git "$AL_LIO_REPOSITORY_DIR" cat-file -t \
+  "$AL_LIO_RELEASE_SHA")" == commit ]] || {
+  printf 'ERROR: recovery candidate is not the exact canonical commit.\n' >&2
+  exit 1
+}
 AL_LIO_RECOVERY_VALIDATOR_DIR="$(
   mktemp -d "$AL_LIO_BACKUP_DIR/.recovery-integrity.XXXXXX"
 )" || {
   printf 'ERROR: cannot create the private recovery integrity directory.\n' >&2
   exit 1
 }
-AL_LIO_RECOVERY_INTEGRITY_HELPER="$AL_LIO_RECOVERY_VALIDATOR_DIR/release-worktree-integrity.sh"
 cleanup_recovery_integrity_helper() {
-  local cleanup_failed=0
-  if [[ -e "${AL_LIO_RECOVERY_INTEGRITY_HELPER:-}" ||
-    -L "${AL_LIO_RECOVERY_INTEGRITY_HELPER:-}" ]]; then
-    rm -f -- "$AL_LIO_RECOVERY_INTEGRITY_HELPER" || cleanup_failed=1
-  fi
+  local cleanup_failed=0 helper=""
+  for helper in "${AL_LIO_RECOVERY_HELPER_TARGETS[@]:-}"; do
+    if [[ -e "$helper" || -L "$helper" ]]; then
+      rm -f -- "$helper" || cleanup_failed=1
+    fi
+  done
   if [[ -d "${AL_LIO_RECOVERY_VALIDATOR_DIR:-}" ]]; then
     rmdir -- "$AL_LIO_RECOVERY_VALIDATOR_DIR" || cleanup_failed=1
   fi
@@ -1256,35 +1273,90 @@ cleanup_recovery_integrity_helper() {
     return 1
   }
 }
-if ! chmod 700 "$AL_LIO_RECOVERY_VALIDATOR_DIR"; then
+declare -a AL_LIO_RECOVERY_HELPER_TARGETS=()
+if ! chmod 700 "$AL_LIO_RECOVERY_VALIDATOR_DIR" ||
+  [[ -L "$AL_LIO_RECOVERY_VALIDATOR_DIR" ||
+    "$(/usr/bin/readlink -f -- "$AL_LIO_RECOVERY_VALIDATOR_DIR")" != \
+      "$AL_LIO_RECOVERY_VALIDATOR_DIR" ||
+    "$(/usr/bin/stat -c '%F|%a|%u' -- "$AL_LIO_RECOVERY_VALIDATOR_DIR")" != \
+      "directory|700|$(/usr/bin/id -u)" ]]; then
   printf 'ERROR: cannot protect the private recovery integrity directory.\n' >&2
-  if ! cleanup_recovery_integrity_helper; then
+  cleanup_recovery_integrity_helper || true
+  exit 1
+fi
+
+declare -a AL_LIO_RECOVERY_HELPER_PATHS=(
+  scripts/lib/release-worktree-integrity.sh
+  scripts/lib/release-expected-manifest.sh
+  scripts/lib/release-physical-topology.sh
+  scripts/lib/release-physical-blobs.sh
+)
+materialize_recovery_helper() {
+  local helper_path="$1" entry="" metadata="" entry_path=""
+  local mode="" type="" object="" extra="" target="" actual_object=""
+  local private_file_mode=600 file_metadata=""
+  entry="$(trusted_recovery_git "$AL_LIO_REPOSITORY_DIR" ls-tree \
+    "$AL_LIO_RELEASE_SHA" -- "$helper_path")" || {
+    printf 'ERROR: cannot read recovery helper metadata: %s\n' "$helper_path" >&2
+    return 1
+  }
+  [[ "$entry" == *$'\t'* && "$entry" != *$'\n'* ]] || {
+    printf 'ERROR: recovery helper has ambiguous metadata: %s\n' "$helper_path" >&2
+    return 1
+  }
+  metadata="${entry%%$'\t'*}"
+  entry_path="${entry#*$'\t'}"
+  IFS=' ' read -r mode type object extra <<< "$metadata"
+  [[ "$entry_path" == "$helper_path" && "$mode" == 100644 &&
+    "$type" == blob && "$object" =~ ^[0-9a-f]{40}$ && -z "$extra" ]] || {
+    printf 'ERROR: recovery helper is not the exact 100644 blob: %s\n' "$helper_path" >&2
+    return 1
+  }
+  target="$AL_LIO_RECOVERY_VALIDATOR_DIR/${helper_path##*/}"
+  [[ ! -e "$target" && ! -L "$target" ]] || return 1
+  AL_LIO_RECOVERY_HELPER_TARGETS+=("$target")
+  trusted_recovery_git "$AL_LIO_REPOSITORY_DIR" cat-file blob "$object" > "$target" || {
+    printf 'ERROR: cannot extract recovery helper blob: %s\n' "$helper_path" >&2
+    return 1
+  }
+  chmod 600 "$target" || return 1
+  [[ -x /usr/bin/cygpath ]] && private_file_mode=700
+  file_metadata="$(/usr/bin/stat -c '%F|%a|%u|%h' -- "$target")" || return 1
+  [[ ! -L "$target" && "$(/usr/bin/readlink -f -- "$target")" == "$target" &&
+    "$file_metadata" == "regular file|$private_file_mode|$(/usr/bin/id -u)|1" ]] || {
+    printf 'ERROR: recovery helper materialization is not private and canonical: %s (%s).\n' \
+      "$helper_path" "$file_metadata" >&2
+    return 1
+  }
+  actual_object="$(trusted_recovery_git "$AL_LIO_REPOSITORY_DIR" \
+    hash-object --no-filters --stdin < "$target")" || return 1
+  [[ "$actual_object" == "$object" ]] || {
+    printf 'ERROR: recovery helper bytes do not match the canonical object: %s\n' \
+      "$helper_path" >&2
+    return 1
+  }
+}
+
+for AL_LIO_RECOVERY_HELPER_PATH in "${AL_LIO_RECOVERY_HELPER_PATHS[@]}"; do
+  materialize_recovery_helper "$AL_LIO_RECOVERY_HELPER_PATH" || {
+    printf 'ERROR: exact recovery integrity helper could not be materialized: %s\n' \
+      "$AL_LIO_RECOVERY_HELPER_PATH" >&2
+    cleanup_recovery_integrity_helper || true
     exit 1
-  fi
-  exit 1
-fi
-if ! git -C "$AL_LIO_RELEASE_DIR" cat-file blob \
-  "$AL_LIO_RECOVERY_INTEGRITY_OBJECT" > "$AL_LIO_RECOVERY_INTEGRITY_HELPER" ||
-  ! chmod 600 "$AL_LIO_RECOVERY_INTEGRITY_HELPER"; then
-  printf 'ERROR: cannot extract the reviewed recovery integrity helper.\n' >&2
-  if ! cleanup_recovery_integrity_helper; then
+  }
+done
+for AL_LIO_RECOVERY_INTEGRITY_HELPER in "${AL_LIO_RECOVERY_HELPER_TARGETS[@]}"; do
+  source "$AL_LIO_RECOVERY_INTEGRITY_HELPER" || {
+    printf 'ERROR: exact recovery integrity helper could not be loaded.\n' >&2
+    cleanup_recovery_integrity_helper || true
     exit 1
-  fi
-  exit 1
-fi
-if ! source "$AL_LIO_RECOVERY_INTEGRITY_HELPER"; then
-  printf 'ERROR: reviewed recovery integrity helper could not be loaded.\n' >&2
-  if ! cleanup_recovery_integrity_helper; then
-    exit 1
-  fi
-  exit 1
-fi
-if ! cleanup_recovery_integrity_helper; then
-  exit 1
-fi
-unset AL_LIO_RECOVERY_INTEGRITY_OBJECT AL_LIO_RECOVERY_INTEGRITY_HELPER \
+  }
+done
+cleanup_recovery_integrity_helper || exit 1
+unset AL_LIO_RECOVERY_HELPER_PATH AL_LIO_RECOVERY_HELPER_PATHS \
+  AL_LIO_RECOVERY_HELPER_TARGETS AL_LIO_RECOVERY_INTEGRITY_HELPER \
   AL_LIO_RECOVERY_VALIDATOR_DIR
-unset -f cleanup_recovery_integrity_helper validate_recovery_integrity_helper_blob
+unset -f cleanup_recovery_integrity_helper materialize_recovery_helper trusted_recovery_git
 
 AL_LIO_HISTORICAL_LEGACY_RELEASE_SHA=dc6607ec88810d90e43d415e6781bc90e1c6612f
 resolve_previous_identity_requirement() {
@@ -1301,7 +1373,8 @@ AL_LIO_PREVIOUS_IDENTITY_REQUIREMENT="$(
 validate_recovery_worktree() {
   local label="$1" release_dir="$2" expected_sha="$3" identity_requirement="$4"
   local env_file="$release_dir/.env" image_tag release_identity
-  if ! validate_release_worktree_integrity "$release_dir" "$expected_sha"; then
+  if ! validate_release_physical_blobs \
+    "$AL_LIO_REPOSITORY_DIR" "$release_dir" "$expected_sha"; then
     printf 'ERROR: %s worktree integrity failed: %s\n' \
       "$label" "$release_worktree_integrity_error" >&2
     return 1
