@@ -742,15 +742,36 @@ test("physical blob verification ignores Git state and compares raw bytes after 
   await check("assume-unchanged cannot hide mutation", async (f) => {
     git(f.release, ["update-index", "--assume-unchanged", "marker.txt"]);
     await writeFile(join(f.release, "marker.txt"), "mutated\n");
+    assert.equal(git(f.release, ["status", "--porcelain", "--", "marker.txt"]), "");
   }, /do not match/);
   await check("skip-worktree cannot hide mutation", async (f) => {
     git(f.release, ["update-index", "--skip-worktree", "marker.txt"]);
     await writeFile(join(f.release, "marker.txt"), "mutated\n");
+    assert.equal(git(f.release, ["status", "--porcelain", "--", "marker.txt"]), "");
   }, /do not match/);
   await check("a manipulated index cannot authorize different bytes", async (f) => {
     await writeFile(join(f.release, "marker.txt"), "mutated\n");
     const changedOid = git(f.repository, ["hash-object", "-w", "--no-filters", join(f.release, "marker.txt")]);
     git(f.release, ["update-index", "--cacheinfo", `100644,${changedOid},marker.txt`]);
+    git(f.release, ["diff", "--quiet", "--", "marker.txt"]);
+    assert.match(git(f.release, ["ls-files", "--stage", "--", "marker.txt"]), new RegExp(changedOid));
+  }, /do not match/);
+  await check("ordinary core.worktree cannot redirect the physical target", async (f) => {
+    const alternate = join(dirname(f.release), "alternate-core-worktree");
+    git(f.repository, ["worktree", "add", "--quiet", "--detach", alternate, f.commitSha]);
+    git(f.release, ["config", "core.worktree", alternate]);
+    await writeFile(join(f.release, "marker.txt"), "mutated\n");
+    assert.equal(git(f.release, ["status", "--porcelain", "--", "marker.txt"]), "M marker.txt");
+    assert.equal(git(f.release, ["rev-parse", "--show-toplevel"]), f.release.replaceAll("\\", "/"));
+  }, /do not match/);
+  await check("worktree-local config cannot redirect the physical target", async (f) => {
+    const alternate = join(dirname(f.release), "alternate-private-worktree");
+    git(f.repository, ["worktree", "add", "--quiet", "--detach", alternate, f.commitSha]);
+    git(f.repository, ["config", "extensions.worktreeConfig", "true"]);
+    git(f.release, ["config", "--worktree", "core.worktree", alternate]);
+    await writeFile(join(f.release, "marker.txt"), "mutated\n");
+    assert.equal(git(f.release, ["status", "--porcelain", "--", "marker.txt"]), "");
+    assert.equal(git(f.release, ["rev-parse", "--show-toplevel"]), alternate.replaceAll("\\", "/"));
   }, /do not match/);
   if (process.platform !== "win32") {
     await check("physical CRLF differs from the canonical LF blob", async (f) => {
