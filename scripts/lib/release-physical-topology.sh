@@ -8,20 +8,25 @@
 declare -a release_expected_topology_records=()
 declare -a release_actual_topology_records=()
 
+sort_release_topology_records() {
+  local -n records="$1"
+  local sort_fd="" sort_pid="" sort_status=0
+  ((${#records[@]} > 0)) || return 0
+  exec {sort_fd}< <(set -o pipefail; builtin printf '%s\0' "${records[@]}" | LC_ALL=C /usr/bin/sort -z -u)
+  sort_pid=$!
+  mapfile -d '' -t records <&"$sort_fd" || sort_status=$?
+  exec {sort_fd}<&-
+  wait "$sort_pid" || sort_status=$?
+  [[ "$sort_status" -eq 0 ]] || {
+    release_worktree_integrity_error="Cannot sort the physical release topology deterministically."
+    return 1
+  }
+}
+
 inspect_release_path() {
-  local path="$1"
-  local label="$2"
-  local required_type="$3"
-  local required_mode="$4"
-  local required_links="$5"
-  local expected_owner="$6"
-  local expected_group="$7"
-  local metadata=""
-  local actual_type=""
-  local actual_mode=""
-  local actual_owner=""
-  local actual_group=""
-  local actual_links=""
+  local path="$1" label="$2" required_type="$3" required_mode="$4"
+  local required_links="$5" expected_owner="$6" expected_group="$7"
+  local metadata="" actual_type="" actual_mode="" actual_owner="" actual_group="" actual_links=""
 
   metadata="$(LC_ALL=C /usr/bin/stat -c '%F|%a|%u|%g|%h' -- "$path" 2>/dev/null)" || {
     release_worktree_integrity_error="Cannot inspect $label: $path"
@@ -37,17 +42,9 @@ inspect_release_path() {
 }
 
 collect_expected_release_topology() {
-  local repository_dir="$1"
-  local expected_sha="$2"
-  local manifest_fd=""
-  local manifest_pid=""
-  local manifest_status=0
-  local record=""
-  local kind=""
-  local mode=""
-  local remainder=""
-  local object_id=""
-  local path=""
+  local repository_dir="$1" expected_sha="$2"
+  local manifest_fd="" manifest_pid="" manifest_status=0
+  local record="" kind="" mode="" remainder="" object_id="" path=""
 
   release_worktree_integrity_error=""
   release_expected_topology_records=()
@@ -78,16 +75,8 @@ collect_expected_release_topology() {
 
 collect_actual_release_topology() {
   local release_dir="$1"
-  local expected_owner=""
-  local expected_group=""
-  local find_fd=""
-  local find_pid=""
-  local find_status=0
-  local physical_path=""
-  local relative_path=""
-  local metadata=""
-  local physical_type=""
-  local physical_mode=""
+  local expected_owner="" expected_group="" find_fd="" find_pid="" find_status=0
+  local physical_path="" relative_path="" metadata="" physical_type="" physical_mode=""
 
   release_worktree_integrity_error=""
   release_actual_topology_records=()
@@ -148,10 +137,10 @@ validate_release_physical_topology() {
   local repository_dir="$1"
   local release_dir="$2"
   local expected_sha="$3"
-  local utility=""
+  local utility="" index=""
 
   release_worktree_integrity_error=""
-  for utility in /usr/bin/find /usr/bin/stat /usr/bin/id /usr/bin/sort /usr/bin/cmp; do
+  for utility in /usr/bin/find /usr/bin/stat /usr/bin/id /usr/bin/sort; do
     [[ -x "$utility" ]] || {
       release_worktree_integrity_error="Required trusted topology utility is unavailable: $utility"
       return 1
@@ -165,10 +154,16 @@ validate_release_physical_topology() {
   validate_release_gitfile_linkage "$repository_dir" "$release_dir" || return 1
   collect_expected_release_topology "$repository_dir" "$expected_sha" || return 1
   collect_actual_release_topology "$release_dir" || return 1
-  /usr/bin/cmp -s \
-    <(builtin printf '%s\0' "${release_expected_topology_records[@]}" | LC_ALL=C /usr/bin/sort -z -u) \
-    <(builtin printf '%s\0' "${release_actual_topology_records[@]}" | LC_ALL=C /usr/bin/sort -z -u) || {
+  sort_release_topology_records release_expected_topology_records || return 1
+  sort_release_topology_records release_actual_topology_records || return 1
+  [[ "${#release_expected_topology_records[@]}" -eq "${#release_actual_topology_records[@]}" ]] || {
+    release_worktree_integrity_error="Physical release topology does not exactly match the canonical candidate tree."
+    return 1
+  }
+  for index in "${!release_expected_topology_records[@]}"; do
+    [[ "${release_expected_topology_records[$index]}" == "${release_actual_topology_records[$index]}" ]] || {
       release_worktree_integrity_error="Physical release topology does not exactly match the canonical candidate tree."
       return 1
     }
+  done
 }
