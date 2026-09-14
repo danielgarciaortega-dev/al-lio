@@ -423,6 +423,54 @@ ${validationScript(fixture.commitSha)}`,
   }
 });
 
+test("final validation does not execute Git hooks, fsmonitor, filters, diff, or textconv", async () => {
+  const root = await mkdtemp(join(tmpdir(), "al-lio-trusted-git-sentinels-"));
+  try {
+    const fixture = await createTopologyFixture(root);
+    const control = join(root, "sentinel-control");
+    const script = join(control, "record-sentinel.sh");
+    await mkdir(control);
+    await writeFile(script, "#!/bin/sh\n: > \"$1\"\ncat\n", "utf8");
+
+    const sentinels = Object.fromEntries(
+      ["hook", "fsmonitor", "clean", "smudge", "diff", "textconv"].map((name) => [
+        name,
+        join(control, `${name}.executed`),
+      ]),
+    );
+    const command = (name) => `sh ${quoteBashPath(script)} ${quoteBashPath(sentinels[name])}`;
+
+    await writeFile(
+      join(fixture.repository, ".git", "info", "attributes"),
+      "*.txt filter=release-sentinel diff=release-sentinel\n",
+      "utf8",
+    );
+    git(fixture.repository, ["config", "core.fsmonitor", command("fsmonitor")]);
+    git(fixture.repository, ["config", "filter.release-sentinel.clean", command("clean")]);
+    git(fixture.repository, ["config", "filter.release-sentinel.smudge", command("smudge")]);
+    git(fixture.repository, ["config", "diff.release-sentinel.command", command("diff")]);
+    git(fixture.repository, ["config", "diff.release-sentinel.textconv", command("textconv")]);
+    await writeFile(
+      join(fixture.repository, ".git", "hooks", "post-checkout"),
+      `#!/bin/sh\n: > ${quoteBashPath(sentinels.hook)}\n`,
+      "utf8",
+    );
+    await chmod(join(fixture.repository, ".git", "hooks", "post-checkout"), 0o755);
+
+    git(fixture.repository, ["hash-object", "--path=marker.txt", "marker.txt"]);
+    assert.equal(await readFile(sentinels.clean, "utf8"), "");
+    await rm(sentinels.clean);
+
+    const result = await runBlobValidation(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    for (const [name, path] of Object.entries(sentinels)) {
+      await assert.rejects(readFile(path), (error) => error.code === "ENOENT", name);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("release gitfile linkage accepts a valid detached worktree", async () => {
   const root = await mkdtemp(join(tmpdir(), "al-lio-release-gitfile-valid-"));
   try {
