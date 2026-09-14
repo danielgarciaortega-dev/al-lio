@@ -130,6 +130,8 @@ async function createTopologyFixture(root) {
   await write(fixture.repository, ".gitattributes", "*.txt text eol=lf\n");
   await write(fixture.repository, ".gitignore", ".ignored\n");
   await write(fixture.repository, "nested/tracked.txt", "nested\n");
+  await write(fixture.repository, "two words.txt", "spaces\n");
+  await write(fixture.repository, "$HOME;$(echo nope) [file].txt", "metacharacters\n");
   if (process.platform !== "win32") {
     await write(fixture.repository, "tab\tname.txt", "tab\n");
     await write(fixture.repository, "line\nname.txt", "line\n");
@@ -138,7 +140,24 @@ async function createTopologyFixture(root) {
   }
   fixture.commitSha = await commitAll(fixture.repository, "topology fixture");
   fixture.release = join(root, "release");
-  git(fixture.repository, ["worktree", "add", "--quiet", "--detach", fixture.release, fixture.commitSha]);
+  if (process.platform === "win32") {
+    git(fixture.repository, ["worktree", "add", "--quiet", "--detach", fixture.release, fixture.commitSha]);
+  } else {
+    const worktreeCommand = [
+      "umask 022; git -C",
+      quoteBashPath(fixture.repository),
+      "worktree add --quiet --detach",
+      quoteBashPath(fixture.release),
+      fixture.commitSha,
+    ].join(" ");
+    const result = spawnSync(
+      bashPath,
+      ["-lc", worktreeCommand],
+      { encoding: "utf8" },
+    );
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+  }
   return fixture;
 }
 
@@ -724,10 +743,20 @@ test("physical topology accepts only the exact non-followed candidate tree", asy
       ["FIFO", (f) => spawnSync(bashPath, ["-lc", `/usr/bin/mkfifo -- ${quoteBashPath(join(f.release, "pipe"))}`]), /unsupported physical type/],
       ["socket", (f) => spawnSync(process.execPath, ["-e", "require('node:net').createServer().listen(process.argv[1],()=>process.exit(0))", join(f.release, "socket")]), /unsupported physical type/],
       ["wrong root mode", (f) => chmod(f.release, 0o700), /Release root/],
+      ["root special bits", (f) => chmod(f.release, 0o1755), /Release root/],
       ["wrong directory mode", (f) => chmod(join(f.release, "nested"), 0o700), /Release directory/],
+      ["directory special bits", (f) => chmod(join(f.release, "nested"), 0o2755), /Release directory/],
       ["wrong file mode", (f) => chmod(join(f.release, "marker.txt"), 0o600), /unsupported mode/],
       ["file special bits", (f) => chmod(join(f.release, "marker.txt"), 0o4644), /unsupported mode/],
       ["wrong env mode", (f) => writeFile(join(f.release, ".env"), "SAFE=fixture\n"), /Release \.env/],
+      [
+        "env special bits",
+        async (f) => {
+          await writeFile(join(f.release, ".env"), "SAFE=fixture\n");
+          await chmod(join(f.release, ".env"), 0o1600);
+        },
+        /Release \.env/,
+      ],
       ["valid private env", async (f) => {
         await writeFile(join(f.release, ".env"), "SAFE=fixture\n");
         await chmod(join(f.release, ".env"), 0o600);
@@ -735,7 +764,10 @@ test("physical topology accepts only the exact non-followed candidate tree", asy
     );
   }
 
-  await t.test("valid tree and deterministic manifest", async () => {
+  const validTreeCase = process.platform === "win32"
+    ? "valid detached tree and deterministic manifest"
+    : "valid detached tree under controlled umask 022 and deterministic manifest";
+  await t.test(validTreeCase, async () => {
     const root = await mkdtemp(join(tmpdir(), "al-lio-release-topology-valid-"));
     try {
       const result = await runTopologyValidation(await createTopologyFixture(root), true);
