@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmod,
   mkdtemp,
   mkdir,
   readFile,
   readdir,
-  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -19,6 +19,12 @@ const approvalsUrl = new URL("../../../../scripts/config/production-compose-env-
 const composeGuardUrl = new URL("../../../../scripts/lib/compose-env-guard.sh", import.meta.url);
 const transitionPolicyUrl = new URL("../../../../scripts/lib/production-transition-policy.sh", import.meta.url);
 const worktreeIntegrityUrl = new URL("../../../../scripts/lib/release-worktree-integrity.sh", import.meta.url);
+const releaseHelperUrls = [
+  worktreeIntegrityUrl,
+  new URL("../../../../scripts/lib/release-expected-manifest.sh", import.meta.url),
+  new URL("../../../../scripts/lib/release-physical-topology.sh", import.meta.url),
+  new URL("../../../../scripts/lib/release-physical-blobs.sh", import.meta.url),
+];
 const bashPath = process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash";
 const historicalSourceSha = "dc6607ec88810d90e43d415e6781bc90e1c6612f";
 const approvalPath = "scripts/config/production-compose-env-removals.allowlist";
@@ -237,36 +243,36 @@ async function withHistoricalFixture(candidateApprovals, work) {
   }
 }
 
-async function createRecoveryFixture() {
+async function createRecoveryFixture({ executableCandidateHelper = false } = {}) {
   const root = await mkdtemp(join(tmpdir(), "al-lio-runbook-recovery-"));
-  const worktreeIntegrity = await readFile(worktreeIntegrityUrl, "utf8");
+  const repository = join(root, "canonical");
   const releasesRoot = join(root, "releases");
-  const previousStaging = join(root, "previous-staging");
-  const candidateStaging = join(root, "candidate-staging");
-  for (const [release, marker] of [
-    [previousStaging, "previous"],
-    [candidateStaging, "candidate"],
-  ]) {
-    await mkdir(release, { recursive: true });
-    await git(release, "init", "--quiet");
-    await git(release, "config", "user.email", "tests@al-lio.invalid");
-    await git(release, "config", "user.name", "AL-LIO tests");
-    await write(release, ".gitignore", ".env\n");
-    await write(release, "marker.txt", `${marker}\n`);
+  await mkdir(repository, { recursive: true });
+  await git(repository, "init", "--quiet");
+  await git(repository, "config", "user.email", "tests@al-lio.invalid");
+  await git(repository, "config", "user.name", "AL-LIO tests");
+  await git(repository, "config", "core.autocrlf", "false");
+  await write(repository, ".gitignore", ".env\n.cache/\n");
+  for (const helperUrl of releaseHelperUrls) {
+    const helperName = helperUrl.pathname.split("/").at(-1);
     await write(
-      release,
-      "scripts/lib/release-worktree-integrity.sh",
-      worktreeIntegrity,
+      repository,
+      `scripts/lib/${helperName}`,
+      await readFile(helperUrl, "utf8"),
     );
-    await commitAll(release, marker);
   }
-  const currentSha = await git(previousStaging, "rev-parse", "HEAD");
-  const candidateSha = await git(candidateStaging, "rev-parse", "HEAD");
+  await write(repository, "marker.txt", "previous\n");
+  const currentSha = await commitAll(repository, "previous");
+  await write(repository, "marker.txt", "candidate\n");
+  if (executableCandidateHelper) {
+    await git(repository, "update-index", "--chmod=+x", "scripts/lib/release-worktree-integrity.sh");
+  }
+  const candidateSha = await commitAll(repository, "candidate");
   const previousRelease = join(releasesRoot, `al-lio-${currentSha.slice(0, 12)}`);
   const candidateRelease = join(releasesRoot, `al-lio-${candidateSha.slice(0, 12)}`);
   await mkdir(releasesRoot, { recursive: true });
-  await rename(previousStaging, previousRelease);
-  await rename(candidateStaging, candidateRelease);
+  await git(repository, "worktree", "add", "--quiet", "--detach", previousRelease, currentSha);
+  await git(repository, "worktree", "add", "--quiet", "--detach", candidateRelease, candidateSha);
   await writeFile(
     join(previousRelease, ".env"),
     `AL_LIO_IMAGE_TAG=${currentSha}\nAL_LIO_RELEASE_SHA=${currentSha}\n`,
@@ -277,6 +283,8 @@ async function createRecoveryFixture() {
     `AL_LIO_IMAGE_TAG=${candidateSha}\nAL_LIO_RELEASE_SHA=${candidateSha}\n`,
     "utf8",
   );
+  await chmod(join(previousRelease, ".env"), 0o600);
+  await chmod(join(candidateRelease, ".env"), 0o600);
   const backupDir = join(root, "backups", "al-lio");
   const backup = join(backupDir, "al_lio_exact.dump");
   const backupBytes = Buffer.from("exact recovery backup\n", "utf8");
@@ -306,6 +314,8 @@ async function createRecoveryFixture() {
   await writeFile(record, requiredRecord, "utf8");
   return {
     root,
+    repository,
+    repositoryPath: toBashPath(repository),
     record,
     recordPath: toBashPath(record),
     releasesRoot,
@@ -350,7 +360,19 @@ async function runRecoveryInitialization(
     .replace(
       "AL_LIO_BACKUP_DIR=/srv/danicode/backups/al-lio",
       `AL_LIO_BACKUP_DIR="${fixture.backupDirPath}"`,
+    )
+    .replace(
+      "AL_LIO_REPOSITORY_DIR=/srv/danicode/projects/al-lio",
+      `AL_LIO_REPOSITORY_DIR="${fixture.repositoryPath}"`,
     );
+  const cleanupMarker =
+    "unset -f cleanup_recovery_integrity_helper materialize_recovery_helper trusted_recovery_git";
+  const executable = process.platform === "win32"
+    ? configured.replace(
+      cleanupMarker,
+      `${cleanupMarker}\n# Git Bash synthesizes modes from the process umask; physical validators have their own Windows coverage.\nvalidate_release_physical_blobs() { validate_release_worktree_integrity "$2" "$3"; }`,
+    )
+    : configured;
   return spawnSync(bashPath, ["-s"], {
     encoding: "utf8",
     input: `
@@ -371,7 +393,7 @@ stat() {
 id() {
   if [[ "\${1:-}" == -u ]]; then printf '197609\\n'; else command id "$@"; fi
 }
-${configured}
+${executable}
 ${postamble}
 printf 'backup=%s\\nchecksum=%s\\ncurrent=%s\\ncandidate=%s\\noutcome=%s\\nimport=%s\\n' \\
   "$AL_LIO_RECOVERY_BACKUP" "$AL_LIO_RECOVERY_BACKUP_CHECKSUM" \\

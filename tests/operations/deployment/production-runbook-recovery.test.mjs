@@ -4,7 +4,7 @@
 // immutable operator contracts that cannot be exercised without that boundary.
 
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   mkdtemp,
   mkdir,
@@ -52,6 +52,64 @@ test("delayed recovery reconstructs exact release and backup provenance from one
     ]) {
       assert.ok(releaseRecord.includes(exactField), `release record omits ${exactField}`);
     }
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("recovery never loads hostile release or replacement helper bytes", async () => {
+  const initialization = bashBlockContaining(
+    await readFile(runbookUrl, "utf8"),
+    "AL_LIO_SELECTED_RELEASE_RECORD",
+  );
+  const fixture = await createRecoveryFixture();
+  const helperPath = "scripts/lib/release-worktree-integrity.sh";
+  const sentinel = join(fixture.root, "hostile-helper-loaded");
+  const hostileBytes = `${await readFile(join(fixture.repository, helperPath), "utf8")}\n` +
+    `printf hostile > "${toBashPath(sentinel)}"\n`;
+  try {
+    await writeFile(join(fixture.repository, helperPath), hostileBytes, "utf8");
+    execFileSync("git", ["add", helperPath], { cwd: fixture.repository });
+    execFileSync("git", ["commit", "--quiet", "-m", "hostile replacement"], {
+      cwd: fixture.repository,
+    });
+    const hostileSha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: fixture.repository,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["replace", fixture.candidateSha, hostileSha], {
+      cwd: fixture.repository,
+    });
+    const positiveControl = execFileSync(
+      "git",
+      ["show", `${fixture.candidateSha}:${helperPath}`],
+      { cwd: fixture.repository, encoding: "utf8" },
+    );
+    assert.match(positiveControl, /hostile-helper-loaded/);
+    await writeFile(join(fixture.candidateRelease, helperPath), hostileBytes, "utf8");
+
+    const rejected = await runRecoveryInitialization(initialization, fixture);
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /candidate worktree integrity failed/);
+    await assert.rejects(readFile(sentinel), { code: "ENOENT" });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("recovery rejects a helper whose canonical tree mode is not exact", async () => {
+  const initialization = bashBlockContaining(
+    await readFile(runbookUrl, "utf8"),
+    "AL_LIO_SELECTED_RELEASE_RECORD",
+  );
+  const fixture = await createRecoveryFixture({ executableCandidateHelper: true });
+  try {
+    const rejected = await runRecoveryInitialization(initialization, fixture);
+    assert.notEqual(rejected.status, 0);
+    assert.match(
+      rejected.stderr,
+      /recovery helper is not the exact 100644 blob: scripts\/lib\/release-worktree-integrity\.sh/,
+    );
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -172,8 +230,9 @@ for (const [name, currentSha, releaseIdentity, expectedStatus, expectedError] of
         encoding: "utf8",
         input: `set -Eeuo pipefail
 AL_LIO_CURRENT_SHA=${currentSha}
+AL_LIO_REPOSITORY_DIR=/fixture/canonical
 PREVIOUS_RELEASE="${toBashPath(root)}"
-validate_release_worktree_integrity() { return 0; }
+validate_release_physical_blobs() { return 0; }
 read_env_value() {
   local key="$1" env_file="$2" line
   line="$(grep -E "^\${key}=" "$env_file" | tail -n 1 || true)"
@@ -265,11 +324,10 @@ for (const [name, mutate, expectedError, options = {}] of [
   [
     "an unexpected ignored file",
     async (fixture) => {
-      await writeFile(join(fixture.candidateRelease, ".git", "info", "exclude"), ".cache/\n", "utf8");
       await write(fixture.candidateRelease, ".cache/unexpected", "unexpected\n");
       return fixture.requiredRecord;
     },
-    /candidate worktree integrity failed: Release worktree contains an unexpected ignored file/,
+    /candidate worktree integrity failed: (?:Release worktree contains an unexpected ignored file|Physical release topology does not exactly match)/,
   ],
   [
     "a previous .env symlink",
