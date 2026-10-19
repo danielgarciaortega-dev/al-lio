@@ -126,7 +126,7 @@
     "eslint-config-next": "15.5.25",
     "knip": "6.34.0",
     "postcss": "^8.5.26",
-    "tailwindcss": "^3.4.17",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5.8.3"
   },
   "overrides": {
