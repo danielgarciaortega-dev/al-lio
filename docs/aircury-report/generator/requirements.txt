@@ -1,2 +1,2 @@
 reportlab==4.4.7
-pypdf==6.16.2
+pypdf==6.21.2
